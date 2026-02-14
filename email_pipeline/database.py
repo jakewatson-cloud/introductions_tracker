@@ -1,0 +1,259 @@
+"""
+Database Module
+===============
+SQLite database for tracking processed emails and pipeline state.
+
+Provides idempotency — ensures each email is only processed once.
+"""
+
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Project paths
+# ---------------------------------------------------------------------------
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_DB_PATH = _PROJECT_ROOT / "data" / "introductions_tracker.db"
+
+
+class Database:
+    """SQLite database for tracking processed emails."""
+
+    def __init__(self, db_path: Optional[str] = None):
+        """Initialize database connection.
+
+        Parameters
+        ----------
+        db_path : str, optional
+            Path to the SQLite database file.
+            Defaults to data/introductions_tracker.db
+        """
+        self.db_path = Path(db_path) if db_path else _DEFAULT_DB_PATH
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _init_db(self):
+        """Create tables if they don't exist."""
+        with sqlite3.connect(self.db_path) as conn:
+            # Processed emails — idempotency tracking
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_emails (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    gmail_message_id TEXT UNIQUE NOT NULL,
+                    subject TEXT,
+                    sender TEXT,
+                    sender_domain TEXT,
+                    email_date TEXT,
+                    processed_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'processed',
+                    is_introduction INTEGER NOT NULL DEFAULT 0,
+                    classification_reason TEXT,
+                    deal_asset_name TEXT,
+                    deal_town TEXT,
+                    archive_folder TEXT,
+                    pipeline_row_added INTEGER DEFAULT 0,
+                    brochures_parsed INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    raw_extraction_json TEXT
+                )
+            """)
+
+            # Create indexes
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_gmail_message_id
+                ON processed_emails(gmail_message_id)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_status
+                ON processed_emails(status)
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_processed_at
+                ON processed_emails(processed_at)
+            """)
+
+            conn.commit()
+
+    def is_processed(self, gmail_message_id: str) -> bool:
+        """Check if an email has already been processed.
+
+        Parameters
+        ----------
+        gmail_message_id : str
+            Gmail message ID to check.
+
+        Returns
+        -------
+        bool
+            True if the email has been processed.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "SELECT 1 FROM processed_emails WHERE gmail_message_id = ?",
+                (gmail_message_id,),
+            ).fetchone()
+            return result is not None
+
+    def mark_processed(
+        self,
+        gmail_message_id: str,
+        subject: str = "",
+        sender: str = "",
+        sender_domain: str = "",
+        email_date: str = "",
+        status: str = "processed",
+        is_introduction: bool = False,
+        classification_reason: str = "",
+        deal_asset_name: str = "",
+        deal_town: str = "",
+        archive_folder: str = "",
+        pipeline_row_added: bool = False,
+        brochures_parsed: int = 0,
+        error_message: str = "",
+        raw_extraction_json: str = "",
+    ) -> None:
+        """Record an email as processed.
+
+        Parameters
+        ----------
+        gmail_message_id : str
+            Gmail message ID.
+        subject, sender, sender_domain, email_date : str
+            Email metadata.
+        status : str
+            Processing status: 'processed', 'skipped', 'error'.
+        is_introduction : bool
+            True if classified as an investment introduction.
+        classification_reason : str
+            Why it was or wasn't classified as an introduction.
+        deal_asset_name, deal_town : str
+            Extracted deal info (if introduction).
+        archive_folder : str
+            Path to the archive folder (if saved).
+        pipeline_row_added : bool
+            True if a row was added to the Pipeline Excel.
+        brochures_parsed : int
+            Number of brochures parsed from attachments.
+        error_message : str
+            Error message if processing failed.
+        raw_extraction_json : str
+            Raw JSON from the AI extraction.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO processed_emails (
+                    gmail_message_id, subject, sender, sender_domain,
+                    email_date, processed_at, status, is_introduction,
+                    classification_reason, deal_asset_name, deal_town,
+                    archive_folder, pipeline_row_added, brochures_parsed,
+                    error_message, raw_extraction_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    gmail_message_id,
+                    subject,
+                    sender,
+                    sender_domain,
+                    email_date,
+                    datetime.now().isoformat(),
+                    status,
+                    1 if is_introduction else 0,
+                    classification_reason,
+                    deal_asset_name,
+                    deal_town,
+                    archive_folder,
+                    1 if pipeline_row_added else 0,
+                    brochures_parsed,
+                    error_message,
+                    raw_extraction_json,
+                ),
+            )
+            conn.commit()
+
+    def get_unprocessed_ids(self, message_ids: list[str]) -> list[str]:
+        """Filter a list of message IDs to only those not yet processed.
+
+        Parameters
+        ----------
+        message_ids : list[str]
+            Gmail message IDs to check.
+
+        Returns
+        -------
+        list[str]
+            Message IDs that have NOT been processed.
+        """
+        if not message_ids:
+            return []
+
+        with sqlite3.connect(self.db_path) as conn:
+            placeholders = ",".join("?" * len(message_ids))
+            rows = conn.execute(
+                f"SELECT gmail_message_id FROM processed_emails WHERE gmail_message_id IN ({placeholders})",
+                message_ids,
+            ).fetchall()
+            processed = {row[0] for row in rows}
+
+        return [mid for mid in message_ids if mid not in processed]
+
+    def get_stats(self) -> dict:
+        """Get processing statistics.
+
+        Returns
+        -------
+        dict
+            Processing statistics.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            total = conn.execute(
+                "SELECT COUNT(*) FROM processed_emails"
+            ).fetchone()[0]
+            introductions = conn.execute(
+                "SELECT COUNT(*) FROM processed_emails WHERE is_introduction = 1"
+            ).fetchone()[0]
+            skipped = conn.execute(
+                "SELECT COUNT(*) FROM processed_emails WHERE status = 'skipped'"
+            ).fetchone()[0]
+            errors = conn.execute(
+                "SELECT COUNT(*) FROM processed_emails WHERE status = 'error'"
+            ).fetchone()[0]
+            pipeline_rows = conn.execute(
+                "SELECT COUNT(*) FROM processed_emails WHERE pipeline_row_added = 1"
+            ).fetchone()[0]
+
+        return {
+            "total_processed": total,
+            "introductions": introductions,
+            "skipped": skipped,
+            "errors": errors,
+            "pipeline_rows_added": pipeline_rows,
+        }
+
+    def get_recent(self, limit: int = 20) -> list[dict]:
+        """Get the most recently processed emails.
+
+        Parameters
+        ----------
+        limit : int
+            Maximum number of records to return.
+
+        Returns
+        -------
+        list[dict]
+            Recent processing records.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """
+                SELECT * FROM processed_emails
+                ORDER BY processed_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            return [dict(row) for row in rows]

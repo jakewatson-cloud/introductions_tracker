@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+
+# Environment variables (credentials)
+.env
+
+# Gmail OAuth2 credentials
+credentials.json
+token.json
+
+# Data
+data/emails/
+data/logs/
+*.db
+
+# Excel backups
+backups/
