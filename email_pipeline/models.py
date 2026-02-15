@@ -139,9 +139,9 @@ class ClassificationResult:
 
 @dataclass
 class ProcessingResult:
-    """Result of processing a single email through the full pipeline."""
+    """Result of processing an email thread through the full pipeline."""
 
-    gmail_message_id: str
+    gmail_message_id: str                                    # Primary (best) email ID
     status: ProcessingStatus
     is_introduction: bool = False
     deals: list[DealExtraction] = field(default_factory=list)
@@ -151,6 +151,7 @@ class ProcessingResult:
     occupational_comps: list[OccupationalComp] = field(default_factory=list)
     brochures_parsed: int = 0
     error_message: str = ""
+    all_gmail_message_ids: list[str] = field(default_factory=list)  # All email IDs in thread
 
 
 @dataclass
@@ -172,6 +173,7 @@ class ProcessingReport:
     already_processed: int = 0
     classified_as_introduction: int = 0
     classified_as_not_introduction: int = 0
+    threads_processed: int = 0
     successfully_processed: int = 0
     pipeline_rows_added: int = 0
     emails_archived: int = 0
@@ -190,6 +192,7 @@ class ProcessingReport:
             f"  Already processed:       {self.already_processed}",
             f"  Introductions found:     {self.classified_as_introduction}",
             f"  Not introductions:       {self.classified_as_not_introduction}",
+            f"  Threads processed:       {self.threads_processed}",
             f"  Successfully processed:  {self.successfully_processed}",
             f"  Pipeline rows added:     {self.pipeline_rows_added}",
             f"  Emails archived:         {self.emails_archived}",

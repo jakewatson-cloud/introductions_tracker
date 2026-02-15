@@ -650,6 +650,8 @@ class ProcessTab(ttk.Frame):
     def _poll_result(self):
         try:
             status, data = self._result_queue.get_nowait()
+            # Drain any remaining log output before showing the report
+            self._drain_log()
             self.proc_btn.config(state="normal")
             if status == "success":
                 self.status_var.set(f"Complete -- {data.successfully_processed} processed")
@@ -660,6 +662,15 @@ class ProcessTab(ttk.Frame):
                 messagebox.showerror("Processing Error", data)
         except queue.Empty:
             self.after(150, self._poll_result)
+
+    def _drain_log(self):
+        """Flush all remaining messages from the log queue into the log panel."""
+        try:
+            while True:
+                msg = self._log_queue.get_nowait()
+                self._append_log(msg if msg.endswith("\n") else msg + "\n")
+        except queue.Empty:
+            pass
 
     # ── Log panel helpers ────────────────────────────────────────────
 

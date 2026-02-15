@@ -26,24 +26,91 @@ from pathlib import Path
 from typing import Optional
 
 from email_pipeline.database import Database
-from email_pipeline.deal_extractor import batch_classify, classify_and_extract
-from email_pipeline.email_archiver import archive_email, get_attachment_paths
-from email_pipeline.email_scanner import scan_emails, _get_body_text, _parse_headers, _extract_sender_domain
+from email_pipeline.deal_extractor import batch_classify, classify_and_extract, _extract_asset_name_from_subject
+from email_pipeline.email_archiver import archive_email, build_archive_folder_name, get_attachment_paths
+from email_pipeline.email_scanner import scan_emails, group_by_thread, _get_body_text, _parse_headers, _extract_sender_domain
 from email_pipeline.brochure_parser import parse_brochure
 from email_pipeline.excel_writer import (
     PipelineWriter,
     InvestmentCompsWriter,
     OccupationalCompsWriter,
+    is_deal_match,
 )
 from email_pipeline.models import (
     ClassificationResult,
     DealExtraction,
+    EmailSummary,
     ProcessingReport,
     ProcessingResult,
     ProcessingStatus,
+    ThreadSummary,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Cross-thread deduplication (within a single pipeline run)
+# ---------------------------------------------------------------------------
+
+# Subjects that clearly aren't property introductions (for stub guard)
+STUB_DISQUALIFIERS = {
+    "comps", "comparables", "comp", "market evidence",
+    "rent review", "dilapidations", "service charge",
+    "schedule of condition",
+}
+
+
+class _RunDeduplicator:
+    """Track deals written in this run to catch cross-thread duplicates.
+
+    Same deal can arrive via multiple Gmail threads (e.g. FW: from colleague,
+    separate intro from a different agent, internal forward). Thread
+    consolidation only groups by thread_id, so this catches the rest.
+    """
+
+    def __init__(self):
+        self.seen: list[tuple[str, str, str]] = []  # (name, town, postcode)
+
+    def check(self, deal: DealExtraction) -> tuple[bool, str]:
+        """Check if deal matches any already written in this run.
+
+        Returns (is_dup, reason).
+        """
+        name = deal.asset_name or ""
+        town = deal.town or ""
+        postcode = deal.postcode or ""
+
+        for seen_name, seen_town, seen_postcode in self.seen:
+            matched, reason = is_deal_match(
+                name_a=name,
+                town_a=town,
+                postcode_a=postcode,
+                name_b=seen_name,
+                town_b=seen_town,
+                postcode_b=seen_postcode,
+            )
+            if matched:
+                return True, f'{reason} with "{seen_name}"'
+
+        return False, ""
+
+    def add(self, deal: DealExtraction):
+        """Register a deal that was successfully written."""
+        self.seen.append((
+            deal.asset_name or "",
+            deal.town or "",
+            deal.postcode or "",
+        ))
+
+
+def _is_stub_disqualified(name: str) -> bool:
+    """Check if a stub name suggests non-introduction content.
+
+    Returns True for subjects like "Comps - Banbury", "FW: Comparables".
+    """
+    name_lower = name.lower()
+    return any(term in name_lower for term in STUB_DISQUALIFIERS)
 
 
 def process_emails(
@@ -140,50 +207,71 @@ def process_emails(
         return report
 
     # -----------------------------------------------------------------------
-    # Step 3: Batch classify with Claude API
+    # Step 3: Classify emails
+    #   - Labelled emails (user-tagged) skip AI — they're confirmed introductions
+    #   - Unlabelled emails go through batch_classify() with Claude API
     # -----------------------------------------------------------------------
-    print(f"\n[Step 3/6] Classifying {len(new_summaries)} emails with AI...")
+    print(f"\n[Step 3/6] Classifying {len(new_summaries)} emails...")
 
-    # Prepare batches of 10
     classifications: dict[str, ClassificationResult] = {}
-    batch_size = 10
-    batches = []
 
-    for i in range(0, len(new_summaries), batch_size):
-        batch = new_summaries[i : i + batch_size]
-        batch_emails = [
-            {
-                "gmail_message_id": s.gmail_message_id,
-                "sender": s.sender,
-                "date": s.date,
-                "subject": s.subject,
-                "snippet": s.snippet,
-                "body_preview": s.body_preview,
+    # Split: labelled emails are pre-confirmed, unlabelled need AI classification
+    labelled = [s for s in new_summaries if s.matched_label]
+    unlabelled = [s for s in new_summaries if not s.matched_label]
+
+    # Pre-confirm labelled emails (no API call needed)
+    if labelled:
+        print(f"  {len(labelled)} email(s) have Gmail label — skipping AI classification")
+        for s in labelled:
+            classifications[s.gmail_message_id] = ClassificationResult(
+                gmail_message_id=s.gmail_message_id,
+                is_introduction=True,
+                confidence=1.0,
+                reason="User-tagged with Investment Introduction label",
+            )
+
+    # Batch classify unlabelled emails with Claude API
+    if unlabelled:
+        print(f"  Classifying {len(unlabelled)} unlabelled email(s) with AI...")
+
+        batch_size = 10
+        batches = []
+
+        for i in range(0, len(unlabelled), batch_size):
+            batch = unlabelled[i : i + batch_size]
+            batch_emails = [
+                {
+                    "gmail_message_id": s.gmail_message_id,
+                    "sender": s.sender,
+                    "date": s.date,
+                    "subject": s.subject,
+                    "snippet": s.snippet,
+                    "body_preview": s.body_preview,
+                }
+                for s in batch
+            ]
+            batches.append((i // batch_size + 1, batch_emails))
+
+        num_batches = len(batches)
+        print(f"  Sending {num_batches} batch(es) to Claude API (concurrent)...")
+
+        def _classify_batch(batch_info):
+            batch_num, batch_emails = batch_info
+            return batch_classify(api_key, batch_emails)
+
+        with ThreadPoolExecutor(max_workers=min(num_batches, 4)) as executor:
+            futures = {
+                executor.submit(_classify_batch, b): b[0]
+                for b in batches
             }
-            for s in batch
-        ]
-        batches.append((i // batch_size + 1, batch_emails))
-
-    num_batches = len(batches)
-    print(f"  Sending {num_batches} batches to Claude API (concurrent)...")
-
-    def _classify_batch(batch_info):
-        batch_num, batch_emails = batch_info
-        return batch_classify(api_key, batch_emails)
-
-    with ThreadPoolExecutor(max_workers=min(num_batches, 4)) as executor:
-        futures = {
-            executor.submit(_classify_batch, b): b[0]
-            for b in batches
-        }
-        done_count = 0
-        for future in as_completed(futures):
-            done_count += 1
-            batch_num = futures[future]
-            print(f"  Batch {batch_num}/{num_batches} classified ({done_count}/{num_batches} done)")
-            results = future.result()
-            for result in results:
-                classifications[result.gmail_message_id] = result
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                batch_num = futures[future]
+                print(f"  Batch {batch_num}/{num_batches} classified ({done_count}/{num_batches} done)")
+                results = future.result()
+                for result in results:
+                    classifications[result.gmail_message_id] = result
 
     # Count classifications
     intro_ids = [
@@ -199,7 +287,7 @@ def process_emails(
     report.classified_as_introduction = len(intro_ids)
     report.classified_as_not_introduction = len(non_intro_ids)
 
-    print(f"  Introductions: {len(intro_ids)}")
+    print(f"  Introductions: {len(intro_ids)} ({len(labelled)} labelled + {len(intro_ids) - len(labelled)} AI-classified)")
     print(f"  Not introductions: {len(non_intro_ids)}")
 
     # Show classification results
@@ -265,9 +353,12 @@ def process_emails(
             return report
 
     # -----------------------------------------------------------------------
-    # Step 5: Process each introduction
+    # Step 5: Group by thread, then process each thread as one introduction
     # -----------------------------------------------------------------------
-    print(f"\n[Step 4/6] Processing {len(intro_ids)} introductions...")
+    intro_summaries = [s for s in new_summaries if s.gmail_message_id in intro_ids]
+    threads = group_by_thread(intro_summaries)
+
+    print(f"\n[Step 4/6] Processing {len(intro_ids)} introductions across {len(threads)} thread(s)...")
 
     # Set up writers (with path validation)
     pipeline_writer = None
@@ -287,76 +378,102 @@ def process_emails(
 
     occ_comps_writer = OccupationalCompsWriter(occupational_comps_path) if occupational_comps_path else None
 
-    for idx, msg_id in enumerate(intro_ids, 1):
-        summary = next(s for s in new_summaries if s.gmail_message_id == msg_id)
-        print(f"\n  [{idx}/{len(intro_ids)}] Processing: {summary.subject[:60]}")
+    # Cross-thread deduplicator: catches same deal across different Gmail threads
+    run_dedup = _RunDeduplicator()
+
+    for idx, thread in enumerate(threads, 1):
+        best = _select_best_email(thread.emails)
+
+        if thread.email_count > 1:
+            print(f"\n  [{idx}/{len(threads)}] Thread: {thread.latest_subject[:60]} ({thread.email_count} emails)")
+            print(f"    Best email: {best.subject[:60]}")
+        else:
+            print(f"\n  [{idx}/{len(threads)}] Processing: {best.subject[:60]}")
 
         try:
-            result = _process_single_email(
+            result = _process_thread(
                 service=service,
                 api_key=api_key,
-                gmail_message_id=msg_id,
-                summary=summary,
+                thread=thread,
+                best_email=best,
                 archive_root=archive_root,
                 pipeline_writer=pipeline_writer,
                 inv_comps_writer=inv_comps_writer,
                 occ_comps_writer=occ_comps_writer,
+                run_dedup=run_dedup,
             )
 
             # Update report
             if result.status == ProcessingStatus.PROCESSED:
                 report.successfully_processed += 1
+                report.threads_processed += 1
                 report.pipeline_rows_added += result.pipeline_rows_added
-                if result.archive_folders:
-                    report.emails_archived += 1
+                report.emails_archived += len(result.archive_folders)
                 report.brochures_parsed += result.brochures_parsed
                 report.investment_comps_added += len(result.investment_comps)
                 report.occupational_comps_added += len(result.occupational_comps)
             elif result.status == ProcessingStatus.ERROR:
                 report.errors += 1
                 report.error_details.append(
-                    f"{summary.subject[:40]}: {result.error_message}"
+                    f"{thread.latest_subject[:40]}: {result.error_message}"
                 )
 
-            # Mark as processed in database
-            primary_deal = result.deals[0] if result.deals else None
-            db.mark_processed(
-                gmail_message_id=msg_id,
-                subject=summary.subject,
-                sender=summary.sender,
-                sender_domain=summary.sender_domain,
-                email_date=summary.date,
-                status=result.status.value,
-                is_introduction=result.is_introduction,
-                classification_reason=classifications[msg_id].reason,
-                deal_asset_name=", ".join(d.asset_name for d in result.deals) if result.deals else "",
-                deal_town=", ".join(d.town for d in result.deals) if result.deals else "",
-                archive_folder=result.archive_folders[0] if result.archive_folders else "",
-                pipeline_row_added=result.pipeline_rows_added > 0,
-                brochures_parsed=result.brochures_parsed,
-                error_message=result.error_message,
-                raw_extraction_json=json.dumps(
-                    [_deal_to_dict(d) for d in result.deals] if result.deals else [],
-                    default=str,
-                ),
-            )
+            # Mark ALL emails in thread as processed in database
+            for email in thread.emails:
+                db.mark_processed(
+                    gmail_message_id=email.gmail_message_id,
+                    subject=email.subject,
+                    sender=email.sender,
+                    sender_domain=email.sender_domain,
+                    email_date=email.date,
+                    status=result.status.value,
+                    is_introduction=result.is_introduction,
+                    classification_reason=classifications.get(
+                        email.gmail_message_id,
+                        ClassificationResult(
+                            gmail_message_id=email.gmail_message_id,
+                            is_introduction=True,
+                            confidence=0.0,
+                            reason="Thread member",
+                        ),
+                    ).reason,
+                    deal_asset_name=", ".join(d.asset_name or "" for d in result.deals) if result.deals else "",
+                    deal_town=", ".join(d.town or "" for d in result.deals) if result.deals else "",
+                    archive_folder=result.archive_folders[0] if result.archive_folders else "",
+                    pipeline_row_added=result.pipeline_rows_added > 0,
+                    brochures_parsed=result.brochures_parsed,
+                    error_message=result.error_message,
+                    raw_extraction_json=json.dumps(
+                        [_deal_to_dict(d) for d in result.deals] if result.deals else [],
+                        default=str,
+                    ),
+                )
 
         except Exception as e:
-            logger.error("  Error processing %s: %s", msg_id, e)
+            logger.error("  Error processing thread %s: %s", thread.thread_id, e)
             report.errors += 1
-            report.error_details.append(f"{summary.subject[:40]}: {e}")
+            report.error_details.append(f"{thread.latest_subject[:40]}: {e}")
 
-            db.mark_processed(
-                gmail_message_id=msg_id,
-                subject=summary.subject,
-                sender=summary.sender,
-                sender_domain=summary.sender_domain,
-                email_date=summary.date,
-                status="error",
-                is_introduction=True,
-                classification_reason=classifications[msg_id].reason,
-                error_message=str(e),
-            )
+            for email in thread.emails:
+                db.mark_processed(
+                    gmail_message_id=email.gmail_message_id,
+                    subject=email.subject,
+                    sender=email.sender,
+                    sender_domain=email.sender_domain,
+                    email_date=email.date,
+                    status="error",
+                    is_introduction=True,
+                    classification_reason=classifications.get(
+                        email.gmail_message_id,
+                        ClassificationResult(
+                            gmail_message_id=email.gmail_message_id,
+                            is_introduction=True,
+                            confidence=0.0,
+                            reason="Thread member",
+                        ),
+                    ).reason,
+                    error_message=str(e),
+                )
 
     # -----------------------------------------------------------------------
     # Step 6: Final report
@@ -366,64 +483,128 @@ def process_emails(
     return report
 
 
-def _process_single_email(
+def _select_best_email(emails: list[EmailSummary]) -> EmailSummary:
+    """Select the best email in a thread for deal extraction.
+
+    Scoring: +3 per attachment, +1 per 1000 chars of body preview.
+    Ties broken by earliest date (original introduction).
+    """
+    if len(emails) == 1:
+        return emails[0]
+
+    def _score(email: EmailSummary) -> float:
+        return len(email.attachment_names) * 3 + len(email.body_preview) / 1000
+
+    return max(emails, key=lambda e: (_score(e), -len(e.date)))
+
+
+def _process_thread(
     service,
     api_key: str,
-    gmail_message_id: str,
-    summary,
+    thread: ThreadSummary,
+    best_email: EmailSummary,
     archive_root: Path,
     pipeline_writer: Optional[PipelineWriter],
     inv_comps_writer: Optional[InvestmentCompsWriter],
     occ_comps_writer: Optional[OccupationalCompsWriter],
+    run_dedup: Optional[_RunDeduplicator] = None,
 ) -> ProcessingResult:
-    """Process a single introduction email through the full pipeline.
+    """Process all emails in a thread as a single introduction.
 
-    Parameters
-    ----------
-    service : Gmail API service.
-    api_key : Anthropic API key.
-    gmail_message_id : Gmail message ID.
-    summary : EmailSummary from the scanner.
-    archive_root : Archive folder root.
-    pipeline_writer : Pipeline Excel writer (or None).
-    inv_comps_writer : Investment comps writer (or None).
-    occ_comps_writer : Occupational comps writer (or None).
-
-    Returns
-    -------
-    ProcessingResult
+    1. Extract deals from the best email (most attachments/content)
+    2. Archive ALL emails in the thread
+    3. Parse brochures from ALL archive folders (deduped by filename)
+    4. Write ONE pipeline row per deal (with cross-thread dedup)
     """
+    all_ids = [e.gmail_message_id for e in thread.emails]
     result = ProcessingResult(
-        gmail_message_id=gmail_message_id,
+        gmail_message_id=best_email.gmail_message_id,
         status=ProcessingStatus.PENDING,
         is_introduction=True,
+        all_gmail_message_ids=all_ids,
     )
 
     try:
-        # 5a. Full classify + extract deal details
+        # --- Step 1: Extract deals from thread ---
         print("    → Extracting deal details with AI...")
-        msg = service.users().messages().get(
-            userId="me", id=gmail_message_id, format="full"
-        ).execute()
 
-        payload = msg.get("payload", {})
-        headers = _parse_headers(payload.get("headers", []))
-        body_text = _get_body_text(payload)
+        if thread.email_count == 1:
+            # Single email thread: fetch and extract as before
+            msg = service.users().messages().get(
+                userId="me", id=best_email.gmail_message_id, format="full"
+            ).execute()
+            payload = msg.get("payload", {})
+            headers = _parse_headers(payload.get("headers", []))
+            body_text = _get_body_text(payload)
+            primary_email = best_email
+        else:
+            # Multi-email thread: concatenate all bodies oldest-first
+            # so Claude sees every deal mentioned across the conversation
+            body_parts = []
+            primary_email = thread.emails[0]  # earliest = original introduction
+
+            for i, email in enumerate(thread.emails, 1):
+                msg = service.users().messages().get(
+                    userId="me", id=email.gmail_message_id, format="full"
+                ).execute()
+                payload = msg.get("payload", {})
+                email_body = _get_body_text(payload)
+
+                if i == 1:
+                    headers = _parse_headers(payload.get("headers", []))
+
+                label = "(oldest)" if i == 1 else "(newest)" if i == len(thread.emails) else ""
+                body_parts.append(
+                    f"=== Email {i} of {thread.email_count} {label} ===\n"
+                    f"From: {email.sender}\n"
+                    f"Date: {email.date}\n"
+                    f"Subject: {email.subject}\n\n"
+                    f"{email_body}"
+                )
+
+            body_text = "\n\n".join(body_parts)
 
         classification, deals = classify_and_extract(
             api_key=api_key,
-            sender=headers.get("from", summary.sender),
-            date=summary.date,
-            subject=headers.get("subject", summary.subject),
+            sender=headers.get("from", primary_email.sender),
+            date=primary_email.date,
+            subject=headers.get("subject", primary_email.subject),
             body=body_text,
-            gmail_message_id=gmail_message_id,
+            gmail_message_id=primary_email.gmail_message_id,
         )
 
         if not deals:
-            result.status = ProcessingStatus.ERROR
-            result.error_message = "AI extraction returned no deal data"
-            print("    ✗ No deal data extracted")
-            return result
+            any_has_attachments = any(e.has_attachments for e in thread.emails)
+            if not classification.is_introduction and not any_has_attachments:
+                result.status = ProcessingStatus.PROCESSED
+                result.is_introduction = False
+                print(f"    — Not an introduction after full analysis ({classification.reason})")
+                return result
+
+            if any_has_attachments:
+                stub_name = _extract_asset_name_from_subject(
+                    headers.get("subject", primary_email.subject)
+                )
+
+                # Guard: disqualify stubs that look like comps/reference data
+                if _is_stub_disqualified(stub_name):
+                    result.status = ProcessingStatus.PROCESSED
+                    result.is_introduction = False
+                    print(f"    — Stub disqualified (looks like comps/reference data): {stub_name}")
+                    return result
+
+                print(f"    — No deals in email body, but thread has attachments — stub: {stub_name}")
+                deals = [DealExtraction(
+                    date=primary_email.date,
+                    agent=_extract_sender_domain(primary_email.sender) or "",
+                    asset_name=stub_name,
+                    raw_source="stub_from_subject",
+                )]
+            else:
+                result.status = ProcessingStatus.ERROR
+                result.error_message = "AI classified as introduction but extracted no deal data"
+                print("    ✗ No deal data extracted")
+                return result
 
         result.deals = deals
         print(f"    ✓ {len(deals)} deal(s) extracted")
@@ -431,33 +612,37 @@ def _process_single_email(
             name_display = deal.asset_name or "(no name)"
             print(f"      [{i+1}] {deal.town}, {name_display} ({deal.classification})")
 
-        # 5b. Archive email + attachments — one folder per deal
+        # --- Step 2: Archive ALL emails in the thread ---
         if archive_root:
-            print("    → Archiving email and attachments...")
-            for deal in deals:
-                archive_folder = archive_email(
-                    service=service,
-                    gmail_message_id=gmail_message_id,
-                    deal=deal,
-                    archive_root=archive_root,
-                    email_subject=summary.subject,
-                    email_sender=summary.sender,
-                    email_date=summary.date,
-                )
-                if archive_folder:
-                    result.archive_folders.append(str(archive_folder))
-                    print(f"    ✓ Archived to: {archive_folder.parent.name}/{archive_folder.name}")
-                else:
-                    print(f"    ✗ Archiving failed for {deal.asset_name or '(unknown)'}")
+            print(f"    → Archiving {len(thread.emails)} email(s)...")
+            for email in thread.emails:
+                for deal in deals:
+                    archive_folder = archive_email(
+                        service=service,
+                        gmail_message_id=email.gmail_message_id,
+                        deal=deal,
+                        archive_root=archive_root,
+                        email_subject=email.subject,
+                        email_sender=email.sender,
+                        email_date=email.date,
+                    )
+                    if archive_folder:
+                        result.archive_folders.append(str(archive_folder))
+                        print(f"      ✓ {archive_folder.parent.name}/{archive_folder.name}")
 
-            # 5c. Parse brochure attachments from FIRST deal's archive folder only
-            # (brochures typically describe the primary/first deal in the email)
+            # --- Step 3: Parse brochures from ALL archive folders (deduped by filename) ---
             if result.archive_folders:
-                primary_folder = Path(result.archive_folders[0])
-                brochure_paths = get_attachment_paths(primary_folder)
-                if brochure_paths:
-                    print(f"    → Parsing {len(brochure_paths)} brochure(s)...")
-                    for bp in brochure_paths:
+                all_brochure_paths = []
+                seen_filenames: set[str] = set()
+                for folder_str in result.archive_folders:
+                    for bp in get_attachment_paths(Path(folder_str)):
+                        if bp.name not in seen_filenames:
+                            all_brochure_paths.append(bp)
+                            seen_filenames.add(bp.name)
+
+                if all_brochure_paths:
+                    print(f"    → Parsing {len(all_brochure_paths)} unique brochure(s)...")
+                    for bp in all_brochure_paths:
                         try:
                             primary_deal = deals[0]
                             br = parse_brochure(
@@ -467,11 +652,16 @@ def _process_single_email(
                             )
                             result.brochures_parsed += 1
 
-                            # 5d. Merge brochure data into the FIRST deal only
+                            if br.error_message:
+                                print(f"    ⚠ Brochure: {br.error_message}")
+
                             if br.deal_extraction:
+                                source_label = "brochure"
+                                if br.deal_extraction.raw_source == "brochure_vision":
+                                    source_label = "brochure (vision)"
                                 deals[0] = _merge_deals(deals[0], br.deal_extraction)
                                 result.deals = deals
-                                print(f"    ✓ Merged brochure data into primary deal")
+                                print(f"    ✓ Merged {source_label} data into primary deal")
 
                             result.investment_comps.extend(br.investment_comps)
                             result.occupational_comps.extend(br.occupational_comps)
@@ -486,25 +676,43 @@ def _process_single_email(
                 else:
                     print("    — No brochure attachments found")
 
-        # 5e. Append EACH deal to Pipeline Excel
+                # --- Step 3b: Rename property folder if we now have better data ---
+                if result.archive_folders and deals:
+                    _try_rename_property_folders(
+                        archive_root=archive_root,
+                        archive_folders=result.archive_folders,
+                        primary_deal=deals[0],
+                        result=result,
+                    )
+
+        # --- Step 4: Write ONE pipeline row per deal ---
         if pipeline_writer:
             print("    → Updating Pipeline Excel...")
             has_brochure = bool(result.archive_folders and result.brochures_parsed > 0)
             brochure_scraped = result.brochures_parsed > 0
             for i, deal in enumerate(deals):
+                # Cross-thread dedup: check against deals already written in THIS run
+                if run_dedup:
+                    is_dup, dup_reason = run_dedup.check(deal)
+                    if is_dup:
+                        print(f"    — Pipeline row skipped (cross-thread duplicate — {dup_reason}): {deal.asset_name or '(no name)'}")
+                        continue
+
                 row_added = pipeline_writer.append_deal(
                     deal=deal,
-                    has_brochure=has_brochure if i == 0 else False,  # brochure only for primary deal
+                    has_brochure=has_brochure if i == 0 else False,
                     brochure_scraped=brochure_scraped if i == 0 else False,
                     comment="Auto-imported",
                 )
                 if row_added:
                     result.pipeline_rows_added += 1
+                    if run_dedup:
+                        run_dedup.add(deal)
                     print(f"    ✓ Pipeline row added: {deal.asset_name or '(no name)'}")
                 else:
-                    print(f"    — Pipeline row skipped (duplicate): {deal.asset_name or '(no name)'}")
+                    print(f"    — Pipeline row skipped (duplicate in Excel): {deal.asset_name or '(no name)'}")
 
-        # 5f. Append comparables to Excel files
+        # --- Step 5: Write comparables ---
         if inv_comps_writer and result.investment_comps:
             print(f"    → Writing {len(result.investment_comps)} investment comps...")
             count = inv_comps_writer.append_comps(result.investment_comps)
@@ -514,6 +722,9 @@ def _process_single_email(
             print(f"    → Writing {len(result.occupational_comps)} occupational comps...")
             count = occ_comps_writer.append_comps(result.occupational_comps)
             print(f"    ✓ {count} occupational comps written")
+
+        if thread.email_count > 1:
+            print(f"    ✓ Thread complete: {thread.email_count} emails → {result.pipeline_rows_added} pipeline row(s)")
 
         result.status = ProcessingStatus.PROCESSED
         return result
@@ -533,15 +744,18 @@ def _merge_deals(email_deal: DealExtraction, brochure_deal: DealExtraction) -> D
     """Merge email and brochure deal data.
 
     Strategy: brochure wins for financial/property fields,
-    email wins for date, agent, and metadata.
+    email wins for date, agent, asset name, and metadata.
+    Asset name keeps the email version (introduction context is more reliable
+    than brochure titles which can be truncated or generic).
     """
     return DealExtraction(
         # Email wins for these
         date=email_deal.date,
         agent=email_deal.agent,
         raw_source="merged",
-        # Brochure wins for property identification (if available)
-        asset_name=brochure_deal.asset_name or email_deal.asset_name,
+        # Email wins for asset name (brochure names can be truncated/generic)
+        asset_name=email_deal.asset_name or brochure_deal.asset_name,
+        # Brochure wins for location/property identification (if available)
         country=brochure_deal.country or email_deal.country,
         town=brochure_deal.town or email_deal.town,
         address=brochure_deal.address or email_deal.address,
@@ -583,3 +797,66 @@ def _deal_to_dict(deal: DealExtraction) -> dict:
         "confidence": deal.confidence,
         "raw_source": deal.raw_source,
     }
+
+
+def _try_rename_property_folders(
+    archive_root: Path,
+    archive_folders: list[str],
+    primary_deal: DealExtraction,
+    result: ProcessingResult,
+) -> None:
+    """Rename property folders if the merged deal data gives a better name.
+
+    After brochure parsing, the primary deal may have richer data (town, asset
+    name from brochure) than the initial email extraction that created the folder.
+    This renames the property-level folder if the new name is substantially better.
+
+    Only renames when:
+    - The ideal name is different from the current name
+    - The ideal name is longer (has more info) than the current name
+    - The target folder doesn't already exist
+    """
+    ideal_name = build_archive_folder_name(primary_deal)
+    if not ideal_name:
+        return
+
+    # Gather unique property-level folders (parents of the dated subfolders)
+    seen_parents: set[str] = set()
+    for folder_str in archive_folders:
+        folder_path = Path(folder_str)
+        parent = folder_path.parent  # property-level folder
+        if str(parent) in seen_parents:
+            continue
+        seen_parents.add(str(parent))
+
+        # Only rename if parent is directly under archive_root
+        if parent.parent != archive_root:
+            continue
+
+        current_name = parent.name
+        if current_name == ideal_name:
+            continue
+
+        # Only rename if the new name is strictly more informative
+        # (longer, or has a comma where the old one doesn't — i.e. gained a town)
+        has_more_info = (
+            len(ideal_name) > len(current_name)
+            or ("," in ideal_name and "," not in current_name)
+        )
+        if not has_more_info:
+            continue
+
+        target = archive_root / ideal_name
+        if target.exists():
+            continue
+
+        try:
+            parent.rename(target)
+            # Update archive_folders references in the result
+            old_prefix = str(parent)
+            for i, af in enumerate(result.archive_folders):
+                if af.startswith(old_prefix):
+                    result.archive_folders[i] = af.replace(old_prefix, str(target), 1)
+            print(f"    ✓ Renamed folder: {current_name} → {ideal_name}")
+        except OSError as e:
+            logger.warning("    Failed to rename folder %s → %s: %s", current_name, ideal_name, e)

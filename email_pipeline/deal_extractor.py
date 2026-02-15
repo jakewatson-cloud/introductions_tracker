@@ -51,7 +51,12 @@ CLASSIFY_AND_EXTRACT_PROMPT = """You are an analyst at a UK commercial property 
 Extract the following fields for EACH property introduced. Use null for anything not mentioned or unclear.
 All monetary values should be in GBP (£). Convert if needed.
 
-**IMPORTANT — Multiple deals**: If the email body contains multiple property introductions (e.g. a reply thread discussing several deals, or an agent introducing more than one property), extract ALL of them as separate deals in the array. Do not limit yourself to the property in the subject line.
+**IMPORTANT — Portfolios vs multiple introductions**:
+- A **portfolio** (multiple properties marketed together as a single investment) is ONE deal. Use classification "Portfolio", and the portfolio name as the asset_name. Do NOT split a portfolio into its individual underlying assets.
+- If the email contains multiple **separate, unrelated** property introductions (e.g. a reply thread where different properties are discussed independently, or an agent listing several unrelated properties), extract each as a separate deal in the array.
+- When in doubt, treat it as a single deal. Only split into multiple deals when the properties are clearly being marketed independently of each other.
+
+**Multi-email threads**: The body below may contain multiple emails from the same thread, separated by "=== Email N of M ===" markers. Extract deals from ALL emails in the thread. A deal mentioned in an earlier email should still be extracted even if later emails in the thread discuss different properties.
 
 - **date**: The date the introduction was sent (DD/MM/YYYY format)
 - **agent**: The agent/firm name sending the introduction (e.g. "CBRE", "Knight Frank"). If forwarded by a colleague, use the ORIGINAL agent.
@@ -121,6 +126,12 @@ Similarly, replies (Re:) that contain an original agent introduction in the thre
 
 **When uncertain**: If an email could plausibly be an introduction, classify it as one. A false positive costs little (the next stage will verify with the full email body), but a false negative means a deal is permanently missed.
 
+**NOT introductions** (common false positives to watch for):
+- Forwarded comparables/comps data ("Comps - Manchester", "FW: Comparables - Banbury") — these are market evidence being shared, not a new property for sale
+- Market reports, research notes, or valuation data
+- Internal valuation requests or rent review discussions
+- Scheduling emails about existing deals (calls, meetings, site visits)
+
 For each email, respond with:
 - **id**: The email number (1, 2, 3, etc.)
 - **is_introduction**: true/false
@@ -152,7 +163,7 @@ def classify_and_extract(
     subject: str,
     body: str,
     gmail_message_id: str = "",
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5-20250929",
 ) -> tuple[ClassificationResult, list[DealExtraction]]:
     """Classify an email and extract deal data if it's an introduction.
 
@@ -240,14 +251,14 @@ def classify_and_extract(
         if is_intro:
             for d in raw_deals:
                 deal = DealExtraction(
-                    date=d.get("date", date),
-                    agent=d.get("agent", ""),
-                    asset_name=d.get("asset_name", ""),
-                    country=d.get("country", "England"),
-                    town=d.get("town", ""),
-                    address=d.get("address", ""),
-                    postcode=d.get("postcode", ""),
-                    classification=d.get("classification", ""),
+                    date=d.get("date", date) or date,
+                    agent=_clean_str(d.get("agent", "")),
+                    asset_name=_clean_str(d.get("asset_name", "")),
+                    country=_clean_str(d.get("country", "England")) or "England",
+                    town=_clean_str(d.get("town", "")),
+                    address=_clean_str(d.get("address", "")),
+                    postcode=_clean_str(d.get("postcode", "")),
+                    classification=_clean_str(d.get("classification", "")),
                     area_acres=_to_float(d.get("area_acres")),
                     area_sqft=_to_float(d.get("area_sqft")),
                     rent_pa=_to_float(d.get("rent_pa")),
@@ -292,7 +303,7 @@ def classify_and_extract(
 def batch_classify(
     api_key: str,
     emails: list[dict],
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5-20250929",
 ) -> list[ClassificationResult]:
     """Classify a batch of emails as introductions or not.
 
@@ -433,6 +444,19 @@ def _extract_asset_name_from_subject(subject: str) -> str:
     cleaned = re.sub(r"\s*-\s+[A-Z]{1,2}\d.*$", "", cleaned).strip()
 
     return cleaned if cleaned else ""
+
+
+def _clean_str(value) -> str:
+    """Sanitise a string value from Claude's JSON response.
+
+    Converts None, JSON null, and the literal string "None"/"null" to empty string.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("null", "none", "n/a"):
+        return ""
+    return s
 
 
 def _to_float(value) -> Optional[float]:

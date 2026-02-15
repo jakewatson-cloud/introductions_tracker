@@ -201,32 +201,64 @@ def scan_emails(
     """
     sender_whitelist = sender_whitelist or []
     keywords = keywords or []
+    has_local_filters = bool(sender_whitelist or keywords)
 
-    # Build the Gmail API query (server-side filtering)
-    query = build_gmail_query(after_date, before_date, label)
+    # -----------------------------------------------------------------------
+    # Fetch message IDs from Gmail API
+    # When BOTH label and keyword/sender filters are active, we need two
+    # queries: one for labelled emails, one for the broad date range (which
+    # keyword/sender filtering will narrow down locally). The results are
+    # merged and deduplicated so we get the union.
+    # -----------------------------------------------------------------------
 
-    print(f"  Scanning Gmail with query: {query or '(all messages)'}")
+    def _fetch_ids(q: str, limit: int) -> list[str]:
+        """Paginate through messages.list and return IDs."""
+        ids = []
+        page_token = None
+        while True:
+            resp = service.users().messages().list(
+                userId="me",
+                q=q,
+                maxResults=min(limit - len(ids), 100),
+                pageToken=page_token,
+            ).execute()
+            msgs = resp.get("messages", [])
+            ids.extend(m["id"] for m in msgs)
+            page_token = resp.get("nextPageToken")
+            if not page_token or len(ids) >= limit:
+                break
+        return ids
 
-    # Fetch message IDs
-    message_ids = []
-    page_token = None
+    label_ids_set: set[str] = set()  # IDs that matched via label
 
-    while True:
-        result = service.users().messages().list(
-            userId="me",
-            q=query,
-            maxResults=min(max_results - len(message_ids), 100),
-            pageToken=page_token,
-        ).execute()
+    if label and has_local_filters:
+        # Both label and keyword/sender active — two queries, merged
+        label_query = build_gmail_query(after_date, before_date, label)
+        broad_query = build_gmail_query(after_date, before_date, None)
+        print(f"  Scanning Gmail with label query: {label_query}")
+        print(f"  Scanning Gmail with broad query: {broad_query}")
 
-        messages = result.get("messages", [])
-        message_ids.extend(m["id"] for m in messages)
+        label_msg_ids = _fetch_ids(label_query, max_results)
+        label_ids_set = set(label_msg_ids)
+        broad_msg_ids = _fetch_ids(broad_query, max_results)
 
-        page_token = result.get("nextPageToken")
-        if not page_token or len(message_ids) >= max_results:
-            break
+        # Merge and deduplicate, preserving order (label first, then broad)
+        seen = set()
+        message_ids = []
+        for mid in label_msg_ids + broad_msg_ids:
+            if mid not in seen:
+                seen.add(mid)
+                message_ids.append(mid)
 
-    print(f"  Found {len(message_ids)} messages matching Gmail query")
+        print(f"  Found {len(label_msg_ids)} labelled + {len(broad_msg_ids)} from broad query = {len(message_ids)} unique")
+    else:
+        # Single query — label only, keyword/sender only, or just date range
+        query = build_gmail_query(after_date, before_date, label)
+        print(f"  Scanning Gmail with query: {query or '(all messages)'}")
+        message_ids = _fetch_ids(query, max_results)
+        if label:
+            label_ids_set = set(message_ids)  # All came from label query
+        print(f"  Found {len(message_ids)} messages matching Gmail query")
 
     if not message_ids:
         return []
@@ -301,7 +333,7 @@ def scan_emails(
         has_attachments = len(attachment_names) > 0
 
         # Apply filters
-        matched_label = label is not None  # If label was in query, it matched server-side
+        matched_label = msg_id in label_ids_set
         matched_sender = _matches_sender(sender_domain, sender_whitelist)
         matched_kws = _matches_keywords(searchable_text, keywords)
 

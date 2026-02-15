@@ -15,7 +15,9 @@ Handles:
 - OneDrive file lock retry with backoff
 """
 
+import difflib
 import logging
+import re
 import shutil
 import time
 from copy import copy
@@ -33,6 +35,116 @@ from email_pipeline.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy deal-matching helpers (used by PipelineWriter + cross-thread dedup)
+# ---------------------------------------------------------------------------
+
+# Words that are common in property names but not distinctive
+_STOP_WORDS = {
+    "the", "a", "an", "and", "of", "at", "in", "on", "for",
+    "site", "park", "estate", "industrial", "trading", "business",
+    "investment", "fund", "intro", "introduction", "portfolio",
+    "centre", "center", "works", "unit", "units", "road", "street",
+    "lane", "way", "drive", "close", "ltd", "limited", "plc",
+    "son", "sons",
+}
+
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace."""
+    name = name.lower().strip()
+    name = re.sub(r"[^\w\s]", " ", name)   # punctuation → space
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def _significant_words(name: str) -> set[str]:
+    """Extract significant (non-stop) words from a property name."""
+    normalised = _normalize_name(name)
+    return {w for w in normalised.split() if w not in _STOP_WORDS and len(w) > 1}
+
+
+def _is_town_match(town_a: str, town_b: str) -> bool:
+    """Check if two towns match, treating empty/multi-location as wildcards."""
+    a = town_a.strip().lower()
+    b = town_b.strip().lower()
+
+    # Wildcards: empty, or multi-location variants
+    if not a or not b:
+        return True
+    if a.startswith("multi") or b.startswith("multi"):
+        return True
+
+    return a == b
+
+
+def is_deal_match(
+    name_a: str,
+    town_a: str,
+    postcode_a: str,
+    name_b: str,
+    town_b: str,
+    postcode_b: str,
+) -> tuple[bool, str]:
+    """Check if two deals represent the same property.
+
+    Returns (is_match, reason) where reason describes the match type.
+    Used by both PipelineWriter._is_duplicate() and _RunDeduplicator.
+
+    Matching tiers (first match wins):
+    1. Exact name + town
+    2. Postcode match (non-empty)
+    3. Substring containment (normalised)
+    4. Significant word overlap (≥2 words, ≥60% of shorter set)
+    5. Fuzzy name match within same town (SequenceMatcher ≥ 0.65)
+    """
+    norm_a = _normalize_name(name_a)
+    norm_b = _normalize_name(name_b)
+
+    # Skip if either name is empty
+    if not norm_a or not norm_b:
+        return False, ""
+
+    # --- Tier 1: Exact name + town ---
+    if norm_a == norm_b and _is_town_match(town_a, town_b):
+        return True, f"exact match"
+
+    # --- Tier 2: Postcode match ---
+    pc_a = postcode_a.strip().upper()
+    pc_b = postcode_b.strip().upper()
+    if pc_a and pc_b and pc_a == pc_b:
+        return True, f"postcode match ({pc_a})"
+
+    # --- Tier 3: Substring containment ---
+    # Require the shorter name to have ≥2 words to avoid false positives
+    # with single-word town/area names (e.g. "Warrington" matching
+    # "Warrington Central Trading Estate & Causeway Park")
+    shorter_norm = norm_a if len(norm_a) <= len(norm_b) else norm_b
+    if len(shorter_norm.split()) >= 2:
+        if norm_a in norm_b:
+            return True, f'"{name_a}" contained in "{name_b}"'
+        if norm_b in norm_a:
+            return True, f'"{name_b}" contained in "{name_a}"'
+
+    # --- Tier 4: Significant word overlap ---
+    words_a = _significant_words(name_a)
+    words_b = _significant_words(name_b)
+
+    if words_a and words_b:
+        overlap = words_a & words_b
+        shorter_len = min(len(words_a), len(words_b))
+        if len(overlap) >= 2 and (len(overlap) / shorter_len) >= 0.6:
+            return True, f"word overlap ({', '.join(sorted(overlap))})"
+
+    # --- Tier 5: Fuzzy name match within same town ---
+    if _is_town_match(town_a, town_b):
+        ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
+        if ratio >= 0.65:
+            return True, f"fuzzy match ({ratio:.0%})"
+
+    return False, ""
 
 # Maximum retries for OneDrive-locked files
 MAX_RETRIES = 3
@@ -138,9 +250,10 @@ class PipelineWriter:
 
         ws = wb[self.SHEET_NAME]
 
-        # Check for duplicate (match on asset_name + town)
-        if self._is_duplicate(ws, deal):
-            logger.info("  Duplicate found: %s, %s — skipping", deal.town, deal.asset_name)
+        # Check for duplicate (multi-tier fuzzy matching)
+        is_dup, dup_reason = self._is_duplicate(ws, deal)
+        if is_dup:
+            logger.info("  Duplicate found (%s): %s — skipping", dup_reason, deal.asset_name)
             return False
 
         # Find next empty row (scan column D = asset_name)
@@ -192,31 +305,54 @@ class PipelineWriter:
 
         return True
 
-    def _is_duplicate(self, ws, deal: DealExtraction) -> bool:
-        """Check if a deal already exists in the sheet."""
+    def _is_duplicate(self, ws, deal: DealExtraction) -> tuple[bool, str]:
+        """Check if a deal already exists in the sheet using fuzzy matching.
+
+        Returns (is_duplicate, reason) where reason describes match type.
+        """
         # If asset_name is empty/None, we can't meaningfully match — allow the write
         if not deal.asset_name or not deal.asset_name.strip():
             logger.warning("  Empty asset_name — skipping duplicate check")
-            return False
+            return False, ""
 
         col_d = self.COLUMNS["asset_name"]  # D
         col_f = self.COLUMNS["town"]        # F
+        col_g = self.COLUMNS["address"]     # G (contains postcode)
+
+        deal_postcode = (deal.postcode or "").strip().upper()
 
         for row in range(self.DATA_START_ROW, ws.max_row + 1):
-            existing_name = str(ws.cell(row=row, column=col_d).value or "").strip().lower()
-            existing_town = str(ws.cell(row=row, column=col_f).value or "").strip().lower()
+            existing_name = str(ws.cell(row=row, column=col_d).value or "").strip()
+            existing_town = str(ws.cell(row=row, column=col_f).value or "").strip()
+            existing_addr = str(ws.cell(row=row, column=col_g).value or "").strip()
 
             if not existing_name:
                 continue
 
-            # Match on asset_name + town
-            if (
-                existing_name == deal.asset_name.strip().lower()
-                and existing_town == deal.town.strip().lower()
-            ):
-                return True
+            # Extract postcode from existing address (last word if it looks like a UK postcode)
+            existing_postcode = ""
+            if existing_addr:
+                # UK postcodes end like "XX1 1XX" — grab last ~8 chars worth
+                addr_parts = existing_addr.split(",")
+                last_part = addr_parts[-1].strip()
+                # Simple UK postcode pattern
+                pc_match = re.search(r"[A-Z]{1,2}\d[\dA-Z]?\s*\d[A-Z]{2}", last_part.upper())
+                if pc_match:
+                    existing_postcode = pc_match.group(0)
 
-        return False
+            matched, reason = is_deal_match(
+                name_a=deal.asset_name,
+                town_a=deal.town or "",
+                postcode_a=deal_postcode,
+                name_b=existing_name,
+                town_b=existing_town,
+                postcode_b=existing_postcode,
+            )
+
+            if matched:
+                return True, f'{reason} with "{existing_name}" in row {row}'
+
+        return False, ""
 
     def _find_next_row(self, ws) -> int:
         """Find the next empty row (scanning column D)."""

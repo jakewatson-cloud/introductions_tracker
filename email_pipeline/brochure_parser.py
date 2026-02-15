@@ -8,9 +8,12 @@ Two extraction modes:
 - Occupational comparables: from tenancy schedules / letting details
 
 Uses pdfplumber for PDF table extraction (primary), PyMuPDF for text fallback,
-and openpyxl for Excel files. Claude API for structured extraction.
+and openpyxl for Excel files. For image-based/scanned PDFs where text extraction
+fails, falls back to Claude's vision API (renders pages as images via PyMuPDF).
+Claude API for structured extraction.
 """
 
+import base64
 import json
 import logging
 from pathlib import Path
@@ -26,6 +29,14 @@ from email_pipeline.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Minimum characters of extracted text to consider "meaningful".
+# Below this threshold, the PDF is likely image-based and we fall back to vision.
+_MIN_TEXT_CHARS = 100
+
+# Vision settings
+_VISION_DPI = 150         # DPI for rendering PDF pages to images
+_VISION_MAX_PAGES = 20    # Max pages to render (keeps API costs reasonable)
 
 # ---------------------------------------------------------------------------
 # Text extraction
@@ -163,6 +174,94 @@ def extract_text(file_path: Path) -> str:
     else:
         logger.warning("Unsupported file type: %s", suffix)
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Vision fallback — render PDF pages as images for Claude's vision API
+# ---------------------------------------------------------------------------
+
+def _render_pdf_pages(pdf_path: Path, dpi: int = _VISION_DPI, max_pages: int = _VISION_MAX_PAGES) -> list[bytes]:
+    """Render PDF pages to PNG image bytes using PyMuPDF.
+
+    Parameters
+    ----------
+    pdf_path : Path
+        Path to the PDF file.
+    dpi : int
+        Resolution for rendering (default 150).
+    max_pages : int
+        Maximum number of pages to render.
+
+    Returns
+    -------
+    list[bytes]
+        List of PNG image bytes, one per page.
+    """
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(str(pdf_path))
+        total_pages = len(doc)
+        page_images = []
+        num_pages = min(total_pages, max_pages)
+
+        for i in range(num_pages):
+            page = doc[i]
+            # Render at specified DPI (default 72 → scale factor = dpi/72)
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            page_images.append(pix.tobytes("png"))
+
+        doc.close()
+
+        if total_pages > max_pages:
+            logger.info("  PDF has %d pages, rendered first %d for vision", total_pages, max_pages)
+
+        return page_images
+
+    except ImportError:
+        logger.error("PyMuPDF not available for vision rendering")
+        return []
+    except Exception as e:
+        logger.error("Failed to render PDF %s as images: %s", pdf_path.name, e)
+        return []
+
+
+def _build_vision_content(page_images: list[bytes], prompt_text: str) -> list[dict]:
+    """Build Claude API content blocks: images first, then text prompt.
+
+    Parameters
+    ----------
+    page_images : list[bytes]
+        PNG image bytes for each page.
+    prompt_text : str
+        The extraction prompt (text-only, no {text} placeholder).
+
+    Returns
+    -------
+    list[dict]
+        Content blocks for the Claude messages API.
+    """
+    blocks: list[dict] = []
+
+    for png_bytes in page_images:
+        b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": b64,
+            },
+        })
+
+    blocks.append({
+        "type": "text",
+        "text": prompt_text,
+    })
+
+    return blocks
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +409,83 @@ Return ONLY valid JSON:
 {text}
 """
 
+# Vision-mode prompt suffixes (no {text} placeholder — images are sent as content blocks)
+_DEAL_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure for a commercial property being marketed for sale. Extract the key deal / property details.
+
+Extract:
+- **asset_name**: Property or estate name
+- **town**: Town/city
+- **address**: Full address
+- **classification**: One of "Multi-Let Industrial", "Single-Let Industrial", "Multi-Let Office", "Single-Let Office", "Retail", "Mixed Use", "Logistics", "Land", "Portfolio", "Other"
+- **area_acres**: Site area in acres (null if not stated)
+- **area_sqft**: Total building area in sq ft (convert from sq m if needed)
+- **rent_pa**: Total passing rent per annum in £
+- **rent_psf**: Rent per sq ft
+- **asking_price**: Asking/quoting price in £
+- **net_yield**: Net Initial Yield as percentage (e.g. 6.5)
+- **reversionary_yield**: Reversionary yield as percentage
+- **confidence**: Your confidence in the extraction (0.0 to 1.0)
+
+Return ONLY valid JSON:
+{
+    "asset_name": "...",
+    "town": "...",
+    "address": "...",
+    "classification": "...",
+    "area_acres": null,
+    "area_sqft": null,
+    "rent_pa": null,
+    "rent_psf": null,
+    "asking_price": null,
+    "net_yield": null,
+    "reversionary_yield": null,
+    "confidence": 0.8
+}"""
+
+_INVESTMENT_COMPS_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure. Extract all **investment comparable evidence** — recent property transactions (sales) used to benchmark pricing.
+
+Look for sections labelled "Comparable Evidence", "Investment Comparables", "Market Transactions", "Recent Sales", or similar.
+
+For each comparable, extract:
+- **town**: Town/city
+- **address**: Property name or address
+- **units**: Number of units (null if not stated)
+- **area_sqft**: Total area in sq ft (convert from sq m if needed: 1 sq m = 10.764 sq ft)
+- **rent_pa**: Passing rent per annum in £
+- **rent_psf**: Rent per sq ft (derive if possible)
+- **awultc**: Average weighted unexpired lease term to certain income (years)
+- **price**: Sale price in £
+- **yield_niy**: Net Initial Yield as a percentage (e.g. 6.5)
+- **reversionary_yield**: Reversionary yield as a percentage
+- **capval_psf**: Capital value per sq ft in £
+- **vendor**: Vendor/seller name
+- **purchaser**: Purchaser/buyer name
+- **date**: Transaction date (DD/MM/YYYY or MM/YYYY)
+
+Return ONLY valid JSON array. Use null for unknown values. If no investment comparables are found, return an empty array: []"""
+
+_OCCUPATIONAL_COMPS_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure. Extract all **occupational / letting comparable evidence** and **tenancy schedule details**.
+
+Look for "Tenancy Schedule", "Occupational Comparables", "Letting Evidence", "Income Schedule" sections.
+
+For each occupational comparable or tenancy, extract:
+- **tenant_name**: Tenant / occupier name
+- **unit_name**: Unit identifier or name (null if not stated)
+- **address**: Property address
+- **town**: Town/city
+- **postcode**: Postcode (null if not stated)
+- **size_sqft**: Unit size in sq ft (convert from sq m if needed)
+- **rent_pa**: Annual rent in £
+- **rent_psf**: Rent per sq ft (derive if possible)
+- **lease_start**: Lease start date (DD/MM/YYYY)
+- **lease_expiry**: Lease expiry date (DD/MM/YYYY)
+- **break_date**: Break date (DD/MM/YYYY or null)
+- **rent_review_date**: Next rent review date (DD/MM/YYYY or null)
+- **lease_term_years**: Total lease term in years
+- **notes**: Any other relevant notes
+
+Return ONLY valid JSON array. Use null for unknown values. If no occupational comparables or tenancy details are found, return an empty array: []"""
+
 
 # ---------------------------------------------------------------------------
 # Main extraction functions
@@ -319,7 +495,7 @@ def parse_brochure(
     file_path: Path,
     api_key: str,
     source_deal: str = "",
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-5-20250929",
     extract_deal: bool = True,
     extract_investment_comps: bool = True,
     extract_occupational_comps: bool = True,
@@ -355,24 +531,42 @@ def parse_brochure(
     logger.info("Extracting text from %s...", file_path.name)
     text = extract_text(file_path)
 
-    if not text.strip():
-        result.error_message = f"No text extracted from {file_path.name}"
-        logger.warning(result.error_message)
-        return result
+    use_vision = False
 
-    logger.info("  Extracted %d characters of text", len(text))
+    if not text.strip() or len(text.strip()) < _MIN_TEXT_CHARS:
+        # Text extraction failed or returned too little — try vision for PDFs
+        if file_path.suffix.lower() == ".pdf":
+            logger.info("  Text extraction returned %d chars (below %d threshold) — trying vision mode",
+                        len(text.strip()), _MIN_TEXT_CHARS)
+            page_images = _render_pdf_pages(file_path)
+            if page_images:
+                use_vision = True
+                logger.info("  Rendered %d pages as images for vision API", len(page_images))
+            else:
+                result.error_message = f"No text and vision rendering failed for {file_path.name}"
+                logger.warning(result.error_message)
+                return result
+        else:
+            result.error_message = f"No text extracted from {file_path.name}"
+            logger.warning(result.error_message)
+            return result
 
-    # Truncate to fit within token limits
-    max_chars = 15000
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n\n[... truncated ...]"
+    if not use_vision:
+        logger.info("  Extracted %d characters of text", len(text))
+        # Truncate to fit within token limits
+        max_chars = 15000
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n\n[... truncated ...]"
 
     client = anthropic.Anthropic(api_key=api_key)
 
     # Step 2: Extract deal details (if requested)
     if extract_deal:
         try:
-            result.deal_extraction = _extract_deal_from_text(client, text, model)
+            if use_vision:
+                result.deal_extraction = _extract_deal_from_vision(client, page_images, model)
+            else:
+                result.deal_extraction = _extract_deal_from_text(client, text, model)
             if result.deal_extraction and not source_deal:
                 source_deal = result.deal_extraction.asset_name or file_path.stem
             logger.info("  Deal extraction: %s",
@@ -383,7 +577,10 @@ def parse_brochure(
     # Step 3: Extract investment comparables (if requested)
     if extract_investment_comps:
         try:
-            result.investment_comps = _extract_investment_comps(client, text, model)
+            if use_vision:
+                result.investment_comps = _extract_investment_comps_vision(client, page_images, model)
+            else:
+                result.investment_comps = _extract_investment_comps(client, text, model)
             logger.info("  Investment comps: %d found", len(result.investment_comps))
         except Exception as e:
             logger.error("  Investment comp extraction failed: %s", e)
@@ -391,9 +588,14 @@ def parse_brochure(
     # Step 4: Extract occupational comparables (if requested)
     if extract_occupational_comps:
         try:
-            result.occupational_comps = _extract_occupational_comps(
-                client, text, source_deal or file_path.stem, model
-            )
+            if use_vision:
+                result.occupational_comps = _extract_occupational_comps_vision(
+                    client, page_images, source_deal or file_path.stem, model
+                )
+            else:
+                result.occupational_comps = _extract_occupational_comps(
+                    client, text, source_deal or file_path.stem, model
+                )
             logger.info("  Occupational comps: %d found", len(result.occupational_comps))
         except Exception as e:
             logger.error("  Occupational comp extraction failed: %s", e)
@@ -425,11 +627,11 @@ def _extract_deal_from_text(
     return DealExtraction(
         date="",  # Not available from brochure
         agent="",  # Not available from brochure
-        asset_name=data.get("asset_name", ""),
+        asset_name=_clean_str(data.get("asset_name", "")),
         country="England",
-        town=data.get("town", ""),
-        address=data.get("address", ""),
-        classification=data.get("classification", ""),
+        town=_clean_str(data.get("town", "")),
+        address=_clean_str(data.get("address", "")),
+        classification=_clean_str(data.get("classification", "")),
         area_acres=_to_float(data.get("area_acres")),
         area_sqft=_to_float(data.get("area_sqft")),
         rent_pa=_to_float(data.get("rent_pa")),
@@ -533,6 +735,137 @@ def _extract_occupational_comps(
 
 
 # ---------------------------------------------------------------------------
+# Vision-mode extraction functions (image-based PDFs)
+# ---------------------------------------------------------------------------
+
+def _extract_deal_from_vision(
+    client: anthropic.Anthropic,
+    page_images: list[bytes],
+    model: str,
+) -> Optional[DealExtraction]:
+    """Extract deal details from brochure page images using Claude's vision API."""
+    content = _build_vision_content(page_images, _DEAL_VISION_PROMPT)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=1000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    response_text = _strip_code_block(message.content[0].text.strip())
+    data = json.loads(response_text)
+
+    return DealExtraction(
+        date="",
+        agent="",
+        asset_name=_clean_str(data.get("asset_name", "")),
+        country="England",
+        town=_clean_str(data.get("town", "")),
+        address=_clean_str(data.get("address", "")),
+        classification=_clean_str(data.get("classification", "")),
+        area_acres=_to_float(data.get("area_acres")),
+        area_sqft=_to_float(data.get("area_sqft")),
+        rent_pa=_to_float(data.get("rent_pa")),
+        rent_psf=_to_float(data.get("rent_psf")),
+        asking_price=_to_float(data.get("asking_price")),
+        net_yield=_to_float(data.get("net_yield")),
+        reversionary_yield=_to_float(data.get("reversionary_yield")),
+        confidence=data.get("confidence", 0.7),
+        raw_source="brochure_vision",
+    )
+
+
+def _extract_investment_comps_vision(
+    client: anthropic.Anthropic,
+    page_images: list[bytes],
+    model: str,
+) -> list[InvestmentComp]:
+    """Extract investment comparables from brochure page images using vision API."""
+    content = _build_vision_content(page_images, _INVESTMENT_COMPS_VISION_PROMPT)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=3000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    response_text = _strip_code_block(message.content[0].text.strip())
+    data = json.loads(response_text)
+
+    if not isinstance(data, list):
+        return []
+
+    comps = []
+    for item in data:
+        comps.append(
+            InvestmentComp(
+                town=item.get("town", ""),
+                address=item.get("address", ""),
+                units=_to_int(item.get("units")),
+                area_sqft=_to_float(item.get("area_sqft")),
+                rent_pa=_to_float(item.get("rent_pa")),
+                rent_psf=_to_float(item.get("rent_psf")),
+                awultc=_to_float(item.get("awultc")),
+                price=_to_float(item.get("price")),
+                yield_niy=_to_float(item.get("yield_niy")),
+                reversionary_yield=_to_float(item.get("reversionary_yield")),
+                capval_psf=_to_float(item.get("capval_psf")),
+                vendor=item.get("vendor"),
+                purchaser=item.get("purchaser"),
+                date=item.get("date"),
+            )
+        )
+
+    return comps
+
+
+def _extract_occupational_comps_vision(
+    client: anthropic.Anthropic,
+    page_images: list[bytes],
+    source_deal: str,
+    model: str,
+) -> list[OccupationalComp]:
+    """Extract occupational comparables from brochure page images using vision API."""
+    content = _build_vision_content(page_images, _OCCUPATIONAL_COMPS_VISION_PROMPT)
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=4000,
+        messages=[{"role": "user", "content": content}],
+    )
+
+    response_text = _strip_code_block(message.content[0].text.strip())
+    data = json.loads(response_text)
+
+    if not isinstance(data, list):
+        return []
+
+    comps = []
+    for item in data:
+        comps.append(
+            OccupationalComp(
+                source_deal=source_deal,
+                tenant_name=item.get("tenant_name", ""),
+                unit_name=item.get("unit_name"),
+                address=item.get("address", ""),
+                town=item.get("town", ""),
+                postcode=item.get("postcode"),
+                size_sqft=_to_float(item.get("size_sqft")),
+                rent_pa=_to_float(item.get("rent_pa")),
+                rent_psf=_to_float(item.get("rent_psf")),
+                lease_start=item.get("lease_start"),
+                lease_expiry=item.get("lease_expiry"),
+                break_date=item.get("break_date"),
+                rent_review_date=item.get("rent_review_date"),
+                lease_term_years=_to_float(item.get("lease_term_years")),
+                notes=item.get("notes"),
+            )
+        )
+
+    return comps
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -543,6 +876,16 @@ def _strip_code_block(text: str) -> str:
         json_lines = [l for l in lines if not l.strip().startswith("```")]
         return "\n".join(json_lines)
     return text
+
+
+def _clean_str(value) -> str:
+    """Sanitise a string value from Claude's JSON — convert None/null to empty string."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("null", "none", "n/a"):
+        return ""
+    return s
 
 
 def _to_float(value) -> Optional[float]:
