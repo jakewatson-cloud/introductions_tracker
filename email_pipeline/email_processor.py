@@ -613,22 +613,53 @@ def _process_thread(
             print(f"      [{i+1}] {deal.town}, {name_display} ({deal.classification})")
 
         # --- Step 2: Archive ALL emails in the thread ---
+        # All emails in a thread go into the SAME dated subfolder (created from
+        # the primary/first email).  This keeps Re:/Fwd: chains together.
         if archive_root:
             print(f"    → Archiving {len(thread.emails)} email(s)...")
-            for email in thread.emails:
-                for deal in deals:
-                    archive_folder = archive_email(
-                        service=service,
-                        gmail_message_id=email.gmail_message_id,
-                        deal=deal,
-                        archive_root=archive_root,
-                        email_subject=email.subject,
-                        email_sender=email.sender,
-                        email_date=email.date,
+
+            # Archive primary email first — this creates the subfolder
+            primary_email_for_archive = thread.emails[0]  # oldest = original intro
+            primary_subfolder = None
+
+            for deal in deals:
+                archive_folder = archive_email(
+                    service=service,
+                    gmail_message_id=primary_email_for_archive.gmail_message_id,
+                    deal=deal,
+                    archive_root=archive_root,
+                    email_subject=primary_email_for_archive.subject,
+                    email_sender=primary_email_for_archive.sender,
+                    email_date=primary_email_for_archive.date,
+                )
+                if archive_folder:
+                    primary_subfolder = archive_folder
+                    result.archive_folders.append(str(archive_folder))
+                    print(f"      ✓ {archive_folder.parent.name}/{archive_folder.name}")
+
+            # Archive remaining thread emails INTO the same subfolder
+            for email in thread.emails[1:]:
+                if primary_subfolder and primary_subfolder.exists():
+                    _archive_thread_email_to_subfolder(
+                        service, email.gmail_message_id, primary_subfolder,
+                        email.subject, email.sender, email.date, deals[0],
                     )
-                    if archive_folder:
-                        result.archive_folders.append(str(archive_folder))
-                        print(f"      ✓ {archive_folder.parent.name}/{archive_folder.name}")
+                    print(f"      ✓ {email.subject[:50]} → (same folder)")
+                else:
+                    # Fallback: archive independently if primary subfolder failed
+                    for deal in deals:
+                        archive_folder = archive_email(
+                            service=service,
+                            gmail_message_id=email.gmail_message_id,
+                            deal=deal,
+                            archive_root=archive_root,
+                            email_subject=email.subject,
+                            email_sender=email.sender,
+                            email_date=email.date,
+                        )
+                        if archive_folder:
+                            result.archive_folders.append(str(archive_folder))
+                            print(f"      ✓ {archive_folder.parent.name}/{archive_folder.name}")
 
             # --- Step 3: Parse brochures from ALL archive folders (deduped by filename) ---
             if result.archive_folders:
@@ -663,6 +694,10 @@ def _process_thread(
                                 result.deals = deals
                                 print(f"    ✓ Merged {source_label} data into primary deal")
 
+                            if br.investment_comps:
+                                for comp in br.investment_comps:
+                                    comp.source_deal = f"{primary_deal.town}, {primary_deal.asset_name}"
+                                    comp.source_file_path = str(bp)
                             result.investment_comps.extend(br.investment_comps)
                             result.occupational_comps.extend(br.occupational_comps)
 
@@ -740,24 +775,106 @@ def _process_thread(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _archive_thread_email_to_subfolder(
+    service,
+    gmail_message_id: str,
+    subfolder: Path,
+    subject: str,
+    sender: str,
+    date: str,
+    deal: DealExtraction,
+) -> None:
+    """Archive a secondary thread email into an existing subfolder.
+
+    Unlike archive_email() which creates a new subfolder, this puts the
+    email body + attachments directly into an existing subfolder so all
+    emails from one thread stay together.
+    """
+    import base64 as b64
+
+    from email_pipeline.email_archiver import (
+        _extract_full_body,
+        _download_attachments,
+        _sanitise_filename,
+    )
+
+    try:
+        msg = service.users().messages().get(
+            userId="me", id=gmail_message_id, format="full"
+        ).execute()
+        payload = msg.get("payload", {})
+
+        # Save email body (append sender+date prefix so they don't overwrite)
+        body_text = _extract_full_body(payload)
+        safe_sender = _sanitise_filename(sender.split("<")[0].strip() or "unknown")
+        body_filename = f"email_body - {safe_sender}.txt"
+        body_path = subfolder / body_filename
+        # Dedup filename
+        counter = 2
+        while body_path.exists():
+            body_path = subfolder / f"email_body - {safe_sender} ({counter}).txt"
+            counter += 1
+        body_path.write_text(body_text, encoding="utf-8")
+
+        # Save attachments (dedup handled by _download_attachments)
+        _download_attachments(service, gmail_message_id, payload, subfolder)
+
+        # Append to metadata.json if it exists
+        metadata_path = subfolder / "metadata.json"
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                thread_emails = metadata.get("thread_emails", [])
+                thread_emails.append({
+                    "gmail_message_id": gmail_message_id,
+                    "subject": subject,
+                    "sender": sender,
+                    "date": date,
+                })
+                metadata["thread_emails"] = thread_emails
+                metadata_path.write_text(
+                    json.dumps(metadata, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    except Exception as e:
+        logger.warning("    Failed to archive thread email %s: %s", gmail_message_id, e)
+
+
 def _merge_deals(email_deal: DealExtraction, brochure_deal: DealExtraction) -> DealExtraction:
     """Merge email and brochure deal data.
 
     Strategy: brochure wins for financial/property fields,
     email wins for date, agent, asset name, and metadata.
-    Asset name keeps the email version (introduction context is more reliable
-    than brochure titles which can be truncated or generic).
+
+    Exception: when the email deal is a stub (extracted from subject line only),
+    the brochure's asset_name and town win because the stub data is minimal.
     """
+    is_stub = email_deal.raw_source == "stub_from_subject"
+
+    # For asset name: brochure wins if email is a stub OR has no name
+    if is_stub and brochure_deal.asset_name:
+        merged_asset_name = brochure_deal.asset_name
+    else:
+        merged_asset_name = email_deal.asset_name or brochure_deal.asset_name
+
+    # For town: brochure wins if email is a stub OR has no town
+    if is_stub and brochure_deal.town:
+        merged_town = brochure_deal.town
+    else:
+        merged_town = brochure_deal.town or email_deal.town
+
     return DealExtraction(
         # Email wins for these
         date=email_deal.date,
         agent=email_deal.agent,
         raw_source="merged",
-        # Email wins for asset name (brochure names can be truncated/generic)
-        asset_name=email_deal.asset_name or brochure_deal.asset_name,
+        asset_name=merged_asset_name,
         # Brochure wins for location/property identification (if available)
         country=brochure_deal.country or email_deal.country,
-        town=brochure_deal.town or email_deal.town,
+        town=merged_town,
         address=brochure_deal.address or email_deal.address,
         postcode=brochure_deal.postcode or email_deal.postcode,
         classification=brochure_deal.classification or email_deal.classification,

@@ -8,6 +8,7 @@ Launch with:
 """
 
 import importlib
+import os
 import queue
 import subprocess
 import sys
@@ -701,6 +702,9 @@ class ProcessTab(ttk.Frame):
 
 class BrochureTab(ttk.Frame):
 
+    _BROCHURE_SUFFIXES = {".pdf", ".xlsx", ".xls"}
+    _SKIP_FILES = {"metadata.json", "email_body.txt"}
+
     def __init__(self, parent, app: "PipelineGUI"):
         super().__init__(parent, padding=12)
         self.app = app
@@ -710,18 +714,30 @@ class BrochureTab(ttk.Frame):
         self._poll_log()
 
     def _build_ui(self):
-        # File selection
-        file_frame = ttk.LabelFrame(self, text="File Selection", padding=8)
-        file_frame.pack(fill="x", pady=(0, 8))
+        # Target selection
+        target_frame = ttk.LabelFrame(self, text="Target", padding=8)
+        target_frame.pack(fill="x", pady=(0, 8))
+        target_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(file_frame, text="File:").grid(row=0, column=0, sticky="w")
+        ttk.Label(target_frame, text="Path:").grid(row=0, column=0, sticky="w")
         self.file_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.file_var, width=70).grid(row=0, column=1, padx=4)
-        ttk.Button(file_frame, text="Browse...", command=self._browse).grid(row=0, column=2)
+        ttk.Entry(target_frame, textvariable=self.file_var, width=70).grid(
+            row=0, column=1, padx=4, sticky="ew")
+        btn_frame = ttk.Frame(target_frame)
+        btn_frame.grid(row=0, column=2)
+        ttk.Button(btn_frame, text="File...", width=7,
+                   command=self._browse_file).pack(side="left", padx=(0, 2))
+        ttk.Button(btn_frame, text="Folder...", width=7,
+                   command=self._browse_folder).pack(side="left")
 
-        ttk.Label(file_frame, text="Source Deal:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(target_frame, text="Source Deal:").grid(
+            row=1, column=0, sticky="w", pady=(6, 0))
         self.deal_var = tk.StringVar()
-        ttk.Entry(file_frame, textvariable=self.deal_var, width=40).grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        ttk.Entry(target_frame, textvariable=self.deal_var, width=40).grid(
+            row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+        self.deal_hint = ttk.Label(target_frame, text="(auto from folder names)",
+                                   foreground="grey")
+        self.deal_hint.grid(row=1, column=2, sticky="w", pady=(6, 0))
 
         # Options
         opts = ttk.LabelFrame(self, text="Extraction Options", padding=6)
@@ -731,16 +747,23 @@ class BrochureTab(ttk.Frame):
         self.extract_inv_var = tk.BooleanVar(value=True)
         self.extract_occ_var = tk.BooleanVar(value=True)
         self.write_var = tk.BooleanVar(value=False)
+        self.clear_old_var = tk.BooleanVar(value=False)
 
-        ttk.Checkbutton(opts, text="Extract deal details", variable=self.extract_deal_var).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Extract investment comparables", variable=self.extract_inv_var).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Extract occupational comparables", variable=self.extract_occ_var).pack(anchor="w")
-        ttk.Checkbutton(opts, text="Write results to Excel files", variable=self.write_var).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(opts, text="Extract deal details",
+                        variable=self.extract_deal_var).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Extract investment comparables",
+                        variable=self.extract_inv_var).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Extract occupational comparables",
+                        variable=self.extract_occ_var).pack(anchor="w")
+        ttk.Checkbutton(opts, text="Write results to Excel files",
+                        variable=self.write_var).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(opts, text="Clear old pipeline comps before writing (folder mode)",
+                        variable=self.clear_old_var).pack(anchor="w")
 
         # Button row
         row = ttk.Frame(self)
         row.pack(fill="x", pady=(0, 8))
-        self.parse_btn = ttk.Button(row, text="Parse Brochure", command=self._on_parse)
+        self.parse_btn = ttk.Button(row, text="Parse", command=self._on_parse)
         self.parse_btn.pack(side="left")
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(row, textvariable=self.status_var).pack(side="right")
@@ -752,7 +775,7 @@ class BrochureTab(ttk.Frame):
 
     # ── Actions ──────────────────────────────────────────────────────
 
-    def _browse(self):
+    def _browse_file(self):
         path = filedialog.askopenfilename(
             title="Select brochure file",
             filetypes=[
@@ -767,17 +790,34 @@ class BrochureTab(ttk.Frame):
             if not self.deal_var.get():
                 self.deal_var.set(Path(path).stem)
 
+    def _browse_folder(self):
+        path = filedialog.askdirectory(title="Select folder to scan for brochures")
+        if path:
+            self.file_var.set(path)
+            self.deal_var.set("")  # Will auto-derive per subfolder
+
     def _on_parse(self):
         fpath = self.file_var.get().strip()
         if not fpath or not Path(fpath).exists():
-            messagebox.showerror("No File", "Please select a valid brochure file.")
+            messagebox.showerror("No Target", "Please select a valid file or folder.")
             return
 
         api_key = cfg.get_anthropic_api_key()
         if not api_key:
-            messagebox.showwarning("Missing API Key", "ANTHROPIC_API_KEY is not set.\nAdd it in the Settings tab.")
+            messagebox.showwarning("Missing API Key",
+                                   "ANTHROPIC_API_KEY is not set.\nAdd it in the Settings tab.")
             return
 
+        target = Path(fpath)
+
+        if target.is_dir():
+            self._run_folder_mode(target, api_key)
+        else:
+            self._run_single_mode(target, api_key)
+
+    # ── Single-file mode ─────────────────────────────────────────────
+
+    def _run_single_mode(self, target: Path, api_key: str):
         self.parse_btn.config(state="disabled")
         self.status_var.set("Parsing...")
         self._clear_results()
@@ -786,18 +826,18 @@ class BrochureTab(ttk.Frame):
 
         def worker():
             return parse_brochure(
-                file_path=Path(fpath),
+                file_path=target,
                 api_key=api_key,
-                source_deal=self.deal_var.get() or Path(fpath).stem,
+                source_deal=self.deal_var.get() or target.stem,
                 extract_deal=self.extract_deal_var.get(),
                 extract_investment_comps=self.extract_inv_var.get(),
                 extract_occupational_comps=self.extract_occ_var.get(),
             )
 
         run_in_thread(worker, self._result_queue, log_queue=self._log_queue)
-        self._poll_result()
+        self._poll_single_result()
 
-    def _poll_result(self):
+    def _poll_single_result(self):
         try:
             status, data = self._result_queue.get_nowait()
             self.parse_btn.config(state="normal")
@@ -809,7 +849,232 @@ class BrochureTab(ttk.Frame):
                 self.status_var.set("Error")
                 messagebox.showerror("Parse Error", data)
         except queue.Empty:
-            self.after(150, self._poll_result)
+            self.after(150, self._poll_single_result)
+
+    # ── Folder mode ──────────────────────────────────────────────────
+
+    def _discover_brochures(self, folder: Path) -> list[tuple[str, Path]]:
+        """Walk a folder tree and return (source_deal, brochure_path) pairs.
+
+        Uses the parent directory name as the deal name when files are in
+        sub-folders; uses the folder name itself for files directly inside.
+        """
+        results: list[tuple[str, Path]] = []
+        brochure_exts = self._BROCHURE_SUFFIXES
+        skip = self._SKIP_FILES
+
+        for root_path, _dirs, files in os.walk(folder):
+            root = Path(root_path)
+            for fname in sorted(files):
+                fpath = root / fname
+                if fpath.suffix.lower() not in brochure_exts:
+                    continue
+                if fpath.name in skip:
+                    continue
+
+                # Derive source deal name from folder structure:
+                # If brochure is inside a date-stamped subfolder like
+                #   "Birmingham, Kings Road / 2026-02-05 - Savills / file.pdf"
+                # use the grandparent folder name ("Birmingham, Kings Road").
+                # Otherwise use the immediate parent name.
+                rel = fpath.relative_to(folder)
+                parts = rel.parts
+                if len(parts) >= 3:
+                    deal_name = parts[0]  # property folder
+                elif len(parts) == 2:
+                    deal_name = parts[0]
+                else:
+                    deal_name = fpath.stem
+
+                results.append((deal_name, fpath))
+
+        return results
+
+    def _run_folder_mode(self, folder: Path, api_key: str):
+        self.parse_btn.config(state="disabled")
+        self.status_var.set("Scanning folder...")
+        self._clear_results()
+
+        # Deal extraction is skipped in folder mode — it only applies to the
+        # Pipeline Excel which this tab doesn't touch.
+        extract_inv = self.extract_inv_var.get()
+        extract_occ = self.extract_occ_var.get()
+        write_excel = self.write_var.get()
+        clear_old = self.clear_old_var.get()
+
+        def worker():
+            from datetime import datetime as _dt
+
+            from email_pipeline.brochure_parser import parse_brochure
+            from email_pipeline.database import Database
+            from email_pipeline.excel_writer import InvestmentCompsWriter, OccupationalCompsWriter
+
+            db = Database(str(cfg.get_db_path()))
+
+            # --- Step 1: Discover brochures ---
+            brochures = self._discover_brochures(folder)
+            if not brochures:
+                print("No brochure files found in folder.")
+                return {"total": 0, "inv": 0, "occ": 0, "errors": []}
+
+            # --- Step 2: Deduplicate identical files ---
+            seen: dict[tuple[str, int], list[str]] = {}
+            unique: list[tuple[str, Path]] = []
+            for deal_name, path in brochures:
+                key = (path.name, path.stat().st_size)
+                if key in seen:
+                    seen[key].append(deal_name)
+                else:
+                    seen[key] = [deal_name]
+                    unique.append((deal_name, path))
+
+            dupes = len(brochures) - len(unique)
+            print(f"Found {len(brochures)} brochure files "
+                  f"({len(unique)} unique, {dupes} duplicates)")
+
+            # --- Step 2b: Filter out already-scraped brochures ---
+            if not clear_old:
+                before_count = len(unique)
+                unique = [
+                    (dn, p) for dn, p in unique
+                    if not db.is_brochure_scraped(str(p), p.stat().st_size)
+                ]
+                skipped = before_count - len(unique)
+                if skipped:
+                    print(f"Skipped {skipped} already-scraped brochures")
+
+            if not unique:
+                print("\nAll brochures already scraped — nothing to do.")
+                print("Use 'Clear old pipeline comps' to re-process everything.")
+                return {"total": 0, "inv": 0, "occ": 0, "errors": []}
+
+            print("=" * 60)
+
+            # --- Step 3: Optionally clear old comps ---
+            if write_excel and clear_old:
+                print("\nClearing old pipeline-written comparables...")
+                from reparse_brochures import clear_pipeline_comps
+                inv_path = cfg.get_investment_comps_path()
+                occ_path = cfg.get_occupational_comps_path()
+                if inv_path:
+                    clear_pipeline_comps(inv_path, occ_path)
+                cleared = db.clear_scraped_brochures()
+                if cleared:
+                    print(f"  Cleared {cleared} scraped brochure records")
+                print()
+
+            # --- Step 4: Parse each brochure ---
+            all_inv = []
+            all_occ = []
+            all_results = []
+            errors = []
+
+            for i, (deal_name, path) in enumerate(unique, 1):
+                key = (path.name, path.stat().st_size)
+                deal_names = seen[key]
+                label = (deal_names[0] if len(deal_names) == 1
+                         else f"{deal_names[0]} (+{len(deal_names)-1} more)")
+
+                print(f"\n[{i}/{len(unique)}] {label} — {path.name}")
+
+                try:
+                    result = parse_brochure(
+                        file_path=path,
+                        api_key=api_key,
+                        source_deal=deal_name,
+                        extract_deal=False,
+                        extract_investment_comps=extract_inv,
+                        extract_occupational_comps=extract_occ,
+                    )
+                    all_results.append((deal_name, result))
+
+                    # Stamp source provenance on investment comps
+                    if result.investment_comps:
+                        for comp in result.investment_comps:
+                            comp.source_deal = deal_name
+                            comp.source_file_path = str(path)
+                        all_inv.extend(result.investment_comps)
+                        print(f"    {len(result.investment_comps)} investment comps")
+                    if result.occupational_comps:
+                        all_occ.extend(result.occupational_comps)
+                        print(f"    {len(result.occupational_comps)} occupational comps")
+                    if result.error_message:
+                        print(f"    Warning: {result.error_message}")
+                        errors.append(f"{deal_name}: {result.error_message}")
+                    if (not result.investment_comps
+                            and not result.occupational_comps
+                            and not result.error_message):
+                        print(f"    No data extracted")
+
+                    # Record in scrape database
+                    db.mark_brochure_scraped(
+                        file_path=str(path),
+                        file_name=path.name,
+                        file_size=path.stat().st_size,
+                        file_modified=_dt.fromtimestamp(path.stat().st_mtime).isoformat(),
+                        deal_name=deal_name,
+                        investment_comps_found=len(result.investment_comps),
+                        occupational_comps_found=len(result.occupational_comps),
+                    )
+
+                except Exception as e:
+                    print(f"    ERROR: {e}")
+                    errors.append(f"{deal_name}: {e}")
+
+            # --- Step 5: Write to Excel ---
+            inv_written = 0
+            occ_written = 0
+
+            if write_excel and all_inv:
+                inv_path = cfg.get_investment_comps_path()
+                if inv_path and inv_path.exists():
+                    inv_written = InvestmentCompsWriter(inv_path).append_comps(all_inv)
+
+            if write_excel and all_occ:
+                occ_path = cfg.get_occupational_comps_path()
+                if occ_path:
+                    occ_written = OccupationalCompsWriter(occ_path).append_comps(all_occ)
+
+            # --- Summary ---
+            print()
+            print("=" * 60)
+            print("Summary")
+            print("=" * 60)
+            print(f"  Brochures parsed:     {len(unique)} ({dupes} duplicates skipped)")
+            print(f"  Investment comps:     {len(all_inv)} extracted"
+                  + (f", {inv_written} written" if write_excel else ""))
+            print(f"  Occupational comps:   {len(all_occ)} extracted"
+                  + (f", {occ_written} written" if write_excel else ""))
+            print(f"  Errors:               {len(errors)}")
+            if errors:
+                for err in errors:
+                    print(f"    - {err}")
+
+            return {
+                "total": len(unique),
+                "inv": len(all_inv),
+                "occ": len(all_occ),
+                "inv_written": inv_written,
+                "occ_written": occ_written,
+                "errors": errors,
+            }
+
+        run_in_thread(worker, self._result_queue, log_queue=self._log_queue)
+        self._poll_folder_result()
+
+    def _poll_folder_result(self):
+        try:
+            status, data = self._result_queue.get_nowait()
+            self.parse_btn.config(state="normal")
+            if status == "success":
+                self.status_var.set("Complete")
+            else:
+                self.status_var.set("Error")
+                messagebox.showerror("Folder Parse Error", data)
+        except queue.Empty:
+            self.after(150, self._poll_folder_result)
+
+    # ── Display (single-file mode) ───────────────────────────────────
 
     def _display_result(self, result):
         lines: list[str] = []
@@ -866,6 +1131,13 @@ class BrochureTab(ttk.Frame):
             return
 
         from email_pipeline.excel_writer import InvestmentCompsWriter, OccupationalCompsWriter
+
+        # Stamp source provenance on investment comps (single-file mode)
+        source_deal = self.deal_var.get() or Path(self.file_var.get()).stem
+        source_path = self.file_var.get()
+        for comp in result.investment_comps:
+            comp.source_deal = source_deal
+            comp.source_file_path = source_path
 
         written: list[str] = []
 

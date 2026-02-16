@@ -49,22 +49,34 @@ class DealExtraction:
 
 @dataclass
 class InvestmentComp:
-    """Investment comparable — maps to INVESTMENT COMPARABLES MASTER columns."""
+    """Investment comparable — maps to INVESTMENT COMPARABLES MASTER '2026 Data' columns.
 
-    town: str                                  # B
-    address: str                               # C
-    units: Optional[int] = None                # D
-    area_sqft: Optional[float] = None          # E
-    rent_pa: Optional[float] = None            # F
-    rent_psf: Optional[float] = None           # G
-    awultc: Optional[float] = None             # H — average weighted unexpired lease term
-    price: Optional[float] = None              # I
-    yield_niy: Optional[float] = None          # J — net initial yield %
-    reversionary_yield: Optional[float] = None # K
-    capval_psf: Optional[float] = None         # L
-    vendor: Optional[str] = None               # M
-    purchaser: Optional[str] = None            # N
-    date: Optional[str] = None                 # O
+    Actual spreadsheet layout (headers row 2, data from row 3):
+        B=Date, C=Quarter, D=Town, E=Style, F=Address, G=Units,
+        H=Area, I=Rent(pa), J=Rent(psf), K=AWULTC, L=Price,
+        M=Yield(NIY), N=RY, O=Cap Val psf, P=Vendor, Q=Purchaser,
+        R=Comment, S=Information Source, T=Link
+    """
+
+    town: str                                  # D
+    address: str                               # F
+    date: Optional[str] = None                 # B — transaction date
+    quarter: Optional[str] = None              # C — e.g. "Q1 2025"
+    style: Optional[str] = None                # E — "Multi-Let", "Single-Let", etc.
+    units: Optional[int] = None                # G
+    area_sqft: Optional[float] = None          # H
+    rent_pa: Optional[float] = None            # I
+    rent_psf: Optional[float] = None           # J
+    awultc: Optional[float] = None             # K — average weighted unexpired lease term
+    price: Optional[float] = None              # L
+    yield_niy: Optional[float] = None          # M — net initial yield %
+    reversionary_yield: Optional[float] = None # N
+    capval_psf: Optional[float] = None         # O
+    vendor: Optional[str] = None               # P
+    purchaser: Optional[str] = None            # Q
+    comment: Optional[str] = None              # R
+    source_deal: Optional[str] = None          # S — Information Source (brochure/deal name)
+    source_file_path: Optional[str] = None     # T — Link (filesystem path to brochure)
 
 
 @dataclass

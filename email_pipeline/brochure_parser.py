@@ -268,52 +268,64 @@ def _build_vision_content(page_images: list[bytes], prompt_text: str) -> list[di
 # AI extraction prompts
 # ---------------------------------------------------------------------------
 
-INVESTMENT_COMPS_PROMPT = """You are a commercial property analyst. Extract all **investment comparable evidence** from the brochure text below.
+INVESTMENT_COMPS_PROMPT = """You are a commercial property data extraction tool. Your task is to extract **investment comparable evidence** from the brochure text below using a strict two-step process.
 
-Investment comparables are recent property transactions (sales) that are used to benchmark pricing. They typically include:
-- Property name and location
-- Sale price, yield (NIY), and date
-- Building size and rent details
+CRITICAL RULES:
+- ONLY extract transactions that are explicitly described in the text with specific details (a named property, a price or yield, and a location).
+- NEVER invent, estimate, or fabricate any data. Every value you return must come directly from the text.
+- If a field is not explicitly stated in the text, use null. Do NOT calculate or derive values.
+- If the brochure contains NO investment comparable evidence at all, return an empty JSON result (see format below).
+- Do NOT confuse the SUBJECT PROPERTY being marketed with comparable evidence. The property being sold in this brochure is NOT a comparable — comparables are OTHER transactions referenced for benchmarking.
+- General market commentary (e.g. "yields have compressed to 5%") is NOT a comparable transaction. You need a specific property name and at least a price or yield.
 
-Look for sections labelled "Comparable Evidence", "Investment Comparables", "Market Transactions", "Recent Sales", or similar. Also look in schedules and tables.
+Investment comparables are recent property transactions (sales) referenced in the brochure as benchmarking evidence. They are typically found in sections labelled "Comparable Evidence", "Investment Comparables", "Market Transactions", "Recent Sales", or similar.
 
-For each comparable, extract:
-- **town**: Town/city
-- **address**: Property name or address
-- **units**: Number of units (null if not stated)
-- **area_sqft**: Total area in sq ft (convert from sq m if needed: 1 sq m = 10.764 sq ft)
-- **rent_pa**: Passing rent per annum in £
-- **rent_psf**: Rent per sq ft (derive if possible)
-- **awultc**: Average weighted unexpired lease term to certain income (years)
-- **price**: Sale price in £
-- **yield_niy**: Net Initial Yield as a percentage (e.g. 6.5)
-- **reversionary_yield**: Reversionary yield as a percentage
-- **capval_psf**: Capital value per sq ft in £
-- **vendor**: Vendor/seller name
-- **purchaser**: Purchaser/buyer name
-- **date**: Transaction date (DD/MM/YYYY or MM/YYYY)
+## TWO-STEP EXTRACTION PROCESS
 
-Return ONLY valid JSON array. Use null for unknown values:
-[
+**STEP 1 — EVIDENCE**: For each comparable, find and quote the EXACT sentence(s) or table row from the brochure that describes the transaction. Copy the text verbatim. If you cannot find a direct quote, do NOT create a comparable entry.
+
+**STEP 2 — EXTRACTION**: Based ONLY on the quoted evidence from Step 1, extract these fields:
+- **town**: Town/city (as stated in the quote)
+- **address**: Property name or address (as stated in the quote)
+- **date**: Transaction date (DD/MM/YYYY or MM/YYYY or year). null if not in the quote.
+- **style**: "Multi-Let", "Single-Let", "Industrial", "Office", "Retail", "Logistics", "Mixed Use", "Portfolio", or null
+- **units**: Number of units. null if not in the quote.
+- **area_sqft**: Total area in sq ft (convert from sq m if needed: 1 sq m = 10.764 sq ft). null if not in the quote.
+- **rent_pa**: Passing rent per annum in £. null if not in the quote.
+- **rent_psf**: Rent per sq ft. null if not in the quote.
+- **awultc**: Average weighted unexpired lease term (years). null if not in the quote.
+- **price**: Sale price in £. null if not in the quote.
+- **yield_niy**: Net Initial Yield as a percentage (e.g. 6.5). null if not in the quote.
+- **reversionary_yield**: Reversionary yield as a percentage. null if not in the quote.
+- **capval_psf**: Capital value per sq ft in £. null if not in the quote.
+- **vendor**: Vendor/seller name. null if not in the quote.
+- **purchaser**: Purchaser/buyer name. null if not in the quote.
+
+Return ONLY a valid JSON object with this structure:
+{{
+  "comparables": [
     {{
-        "town": "Birmingham",
-        "address": "Matrix Park",
-        "units": 8,
-        "area_sqft": 45000,
-        "rent_pa": 350000,
-        "rent_psf": 7.78,
-        "awultc": 5.2,
-        "price": 5250000,
-        "yield_niy": 6.3,
-        "reversionary_yield": 7.1,
-        "capval_psf": 116.67,
-        "vendor": "Legal & General",
-        "purchaser": "Brydell Partners",
-        "date": "03/2025"
+      "evidence": "the exact verbatim quote from the brochure that describes this transaction",
+      "town": "...",
+      "address": "...",
+      "date": null,
+      "style": null,
+      "units": null,
+      "area_sqft": null,
+      "rent_pa": null,
+      "rent_psf": null,
+      "awultc": null,
+      "price": null,
+      "yield_niy": null,
+      "reversionary_yield": null,
+      "capval_psf": null,
+      "vendor": null,
+      "purchaser": null
     }}
-]
+  ]
+}}
 
-If no investment comparables are found, return an empty array: []
+If no comparables found, return: {{"comparables": []}}
 
 ## Brochure text:
 
@@ -442,27 +454,64 @@ Return ONLY valid JSON:
     "confidence": 0.8
 }"""
 
-_INVESTMENT_COMPS_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure. Extract all **investment comparable evidence** — recent property transactions (sales) used to benchmark pricing.
+_INVESTMENT_COMPS_VISION_PROMPT = """You are a commercial property data extraction tool. The images above are pages from an investment brochure. Extract ONLY investment comparable evidence that is EXPLICITLY SHOWN in these pages, using a strict two-step process.
+
+CRITICAL RULES:
+- ONLY extract transactions that are explicitly shown with specific details (a named property, a price or yield, and a location).
+- NEVER invent, estimate, or fabricate any data. Every value must be visible in the images.
+- If a field is not visible, use null. Do NOT calculate or derive values.
+- If these pages contain NO investment comparable evidence, return: {"comparables": []}
+- Do NOT confuse the SUBJECT PROPERTY being marketed with comparable evidence. Comparables are OTHER transactions referenced for benchmarking.
+- General market commentary is NOT a comparable transaction.
 
 Look for sections labelled "Comparable Evidence", "Investment Comparables", "Market Transactions", "Recent Sales", or similar.
 
-For each comparable, extract:
-- **town**: Town/city
-- **address**: Property name or address
-- **units**: Number of units (null if not stated)
-- **area_sqft**: Total area in sq ft (convert from sq m if needed: 1 sq m = 10.764 sq ft)
-- **rent_pa**: Passing rent per annum in £
-- **rent_psf**: Rent per sq ft (derive if possible)
-- **awultc**: Average weighted unexpired lease term to certain income (years)
-- **price**: Sale price in £
-- **yield_niy**: Net Initial Yield as a percentage (e.g. 6.5)
-- **reversionary_yield**: Reversionary yield as a percentage
-- **capval_psf**: Capital value per sq ft in £
-- **vendor**: Vendor/seller name
-- **purchaser**: Purchaser/buyer name
-- **date**: Transaction date (DD/MM/YYYY or MM/YYYY)
+## TWO-STEP EXTRACTION PROCESS
 
-Return ONLY valid JSON array. Use null for unknown values. If no investment comparables are found, return an empty array: []"""
+**STEP 1 — EVIDENCE**: For each comparable, transcribe the EXACT text or table row visible in the image that describes the transaction. If you cannot read specific text describing a transaction, do NOT create a comparable entry.
+
+**STEP 2 — EXTRACTION**: Based ONLY on the transcribed evidence from Step 1, extract these fields:
+- **town**: Town/city. null if not in the evidence.
+- **address**: Property name or address. null if not in the evidence.
+- **date**: Transaction date (DD/MM/YYYY or MM/YYYY or year). null if not in the evidence.
+- **style**: "Multi-Let", "Single-Let", "Industrial", "Office", "Retail", "Logistics", "Mixed Use", "Portfolio", or null
+- **units**: Number of units. null if not in the evidence.
+- **area_sqft**: Total area in sq ft (convert from sq m if needed). null if not in the evidence.
+- **rent_pa**: Passing rent per annum in £. null if not in the evidence.
+- **rent_psf**: Rent per sq ft. null if not in the evidence.
+- **awultc**: Average weighted unexpired lease term (years). null if not in the evidence.
+- **price**: Sale price in £. null if not in the evidence.
+- **yield_niy**: Net Initial Yield as a percentage (e.g. 6.5). null if not in the evidence.
+- **reversionary_yield**: Reversionary yield as a percentage. null if not in the evidence.
+- **capval_psf**: Capital value per sq ft in £. null if not in the evidence.
+- **vendor**: Vendor/seller name. null if not in the evidence.
+- **purchaser**: Purchaser/buyer name. null if not in the evidence.
+
+Return ONLY a valid JSON object with this structure:
+{
+  "comparables": [
+    {
+      "evidence": "the exact text transcribed from the image that describes this transaction",
+      "town": "...",
+      "address": "...",
+      "date": null,
+      "style": null,
+      "units": null,
+      "area_sqft": null,
+      "rent_pa": null,
+      "rent_psf": null,
+      "awultc": null,
+      "price": null,
+      "yield_niy": null,
+      "reversionary_yield": null,
+      "capval_psf": null,
+      "vendor": null,
+      "purchaser": null
+    }
+  ]
+}
+
+If no comparables found, return: {"comparables": []}"""
 
 _OCCUPATIONAL_COMPS_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure. Extract all **occupational / letting comparable evidence** and **tenancy schedule details**.
 
@@ -486,19 +535,83 @@ For each occupational comparable or tenancy, extract:
 
 Return ONLY valid JSON array. Use null for unknown values. If no occupational comparables or tenancy details are found, return an empty array: []"""
 
+# ---------------------------------------------------------------------------
+# Judge / verification prompts
+# ---------------------------------------------------------------------------
+
+_INVESTMENT_COMPS_JUDGE_PROMPT = """You are a verification assistant for commercial property data extraction. You have been given the ORIGINAL BROCHURE TEXT and a set of EXTRACTED COMPARABLES (in JSON).
+
+Your job is to verify each comparable against the original text. For each comparable, check:
+
+1. **EXISTS**: Does this transaction actually appear in the brochure text? Is there a real sentence or table row describing it?
+2. **EVIDENCE CHECK**: Does the "evidence" field match actual text from the brochure (not fabricated)?
+3. **DATA ACCURACY**: Do the extracted values (price, yield, area, rent, etc.) match what the evidence text says?
+4. **NOT THE SUBJECT PROPERTY**: Is this a COMPARABLE transaction, not the property being marketed in this brochure?
+
+For each comparable, return a verdict:
+- "keep" — the comparable is genuine and accurately extracted
+- "remove" — the comparable appears fabricated, is the subject property, or has no supporting evidence in the text
+
+Return ONLY a valid JSON object:
+{{
+  "verdicts": [
+    {{"index": 0, "verdict": "keep", "reason": "Transaction found in text on page 5"}},
+    {{"index": 1, "verdict": "remove", "reason": "No mention of this property anywhere in the brochure"}}
+  ]
+}}
+
+## Original brochure text:
+
+{text}
+
+## Extracted comparables to verify:
+
+{comps_json}
+"""
+
+_INVESTMENT_COMPS_JUDGE_VISION_PROMPT = """You are a verification assistant for commercial property data extraction. You have been shown the ORIGINAL BROCHURE PAGES (as images) and below is a set of EXTRACTED COMPARABLES (in JSON).
+
+Your job is to verify each comparable against the original pages. For each comparable, check:
+
+1. **EXISTS**: Does this transaction actually appear in the brochure pages? Is there a real sentence or table row describing it?
+2. **EVIDENCE CHECK**: Does the "evidence" field match actual text visible in the pages (not fabricated)?
+3. **DATA ACCURACY**: Do the extracted values (price, yield, area, rent, etc.) match what is visible in the pages?
+4. **NOT THE SUBJECT PROPERTY**: Is this a COMPARABLE transaction, not the property being marketed in this brochure?
+
+For each comparable, return a verdict:
+- "keep" — the comparable is genuine and accurately extracted
+- "remove" — the comparable appears fabricated, is the subject property, or has no supporting evidence in the pages
+
+Return ONLY a valid JSON object:
+{
+  "verdicts": [
+    {"index": 0, "verdict": "keep", "reason": "Transaction visible in table on page 5"},
+    {"index": 1, "verdict": "remove", "reason": "No mention of this property anywhere in the brochure"}
+  ]
+}
+
+## Extracted comparables to verify:
+
+"""
+
 
 # ---------------------------------------------------------------------------
 # Main extraction functions
 # ---------------------------------------------------------------------------
+
+_DEFAULT_JUDGE_MODEL = None  # None = use same model as extractor
+
 
 def parse_brochure(
     file_path: Path,
     api_key: str,
     source_deal: str = "",
     model: str = "claude-sonnet-4-5-20250929",
+    judge_model: str = _DEFAULT_JUDGE_MODEL,
     extract_deal: bool = True,
     extract_investment_comps: bool = True,
     extract_occupational_comps: bool = True,
+    verify_comps: bool = True,
 ) -> BrochureResult:
     """Parse a brochure file and extract all comparables.
 
@@ -511,13 +624,21 @@ def parse_brochure(
     source_deal : str
         Name of the source deal (for occupational comp tracking).
     model : str
-        Claude model to use.
+        Claude model to use for extraction (Sonnet recommended).
+    judge_model : str or None
+        Model for verification judge. Defaults to None which uses the
+        same model as the extractor (recommended — prompt caching means
+        the cost overhead is minimal). Set to a different model ID to
+        use a different model, or set verify_comps=False to disable.
     extract_deal : bool
         Whether to extract deal/property details.
     extract_investment_comps : bool
         Whether to extract investment comparables.
     extract_occupational_comps : bool
         Whether to extract occupational comparables.
+    verify_comps : bool
+        Whether to run the judge verification step on investment comps.
+        Requires judge_model to be set.
 
     Returns
     -------
@@ -578,10 +699,25 @@ def parse_brochure(
     if extract_investment_comps:
         try:
             if use_vision:
-                result.investment_comps = _extract_investment_comps_vision(client, page_images, model)
+                comps, raw_items = _extract_investment_comps_vision(client, page_images, model)
             else:
-                result.investment_comps = _extract_investment_comps(client, text, model)
-            logger.info("  Investment comps: %d found", len(result.investment_comps))
+                comps, raw_items = _extract_investment_comps(client, text, model)
+            logger.info("  Investment comps: %d extracted", len(comps))
+
+            # Step 3b: Judge verification (if enabled and comps were found)
+            if verify_comps and comps:
+                _judge = judge_model or model  # Default: same model as extractor
+                logger.info("  Running judge verification (%s)...", _judge)
+                if use_vision:
+                    comps = _verify_investment_comps_vision(
+                        client, page_images, comps, raw_items, _judge
+                    )
+                else:
+                    comps = _verify_investment_comps(
+                        client, text, comps, raw_items, _judge
+                    )
+
+            result.investment_comps = comps
         except Exception as e:
             logger.error("  Investment comp extraction failed: %s", e)
 
@@ -648,28 +784,52 @@ def _extract_investment_comps(
     client: anthropic.Anthropic,
     text: str,
     model: str,
-) -> list[InvestmentComp]:
-    """Extract investment comparables from brochure text using Claude API."""
+) -> tuple[list[InvestmentComp], list[dict]]:
+    """Extract investment comparables from brochure text using Claude API.
+
+    Returns
+    -------
+    tuple[list[InvestmentComp], list[dict]]
+        (comps, raw_items) — the raw_items include the 'evidence' field
+        for use by the judge verification step.
+    """
     prompt = INVESTMENT_COMPS_PROMPT.format(text=text)
 
     message = client.messages.create(
         model=model,
         max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        messages=[{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "text": prompt,
+                "cache_control": {"type": "ephemeral"},
+            }],
+        }],
     )
 
     response_text = _strip_code_block(message.content[0].text.strip())
     data = json.loads(response_text)
 
-    if not isinstance(data, list):
-        return []
+    # Handle CoVe format {"comparables": [...]} or legacy bare array [...]
+    items = _unwrap_comps_response(data)
+    if items is None:
+        return [], []
 
     comps = []
-    for item in data:
+    for item in items:
+        date_str = item.get("date")
+        evidence = item.get("evidence", "")
+        if evidence:
+            logger.debug("  Evidence: %s", evidence[:120])
         comps.append(
             InvestmentComp(
                 town=item.get("town", ""),
                 address=item.get("address", ""),
+                date=date_str,
+                quarter=_derive_quarter(date_str),
+                style=item.get("style"),
                 units=_to_int(item.get("units")),
                 area_sqft=_to_float(item.get("area_sqft")),
                 rent_pa=_to_float(item.get("rent_pa")),
@@ -681,11 +841,10 @@ def _extract_investment_comps(
                 capval_psf=_to_float(item.get("capval_psf")),
                 vendor=item.get("vendor"),
                 purchaser=item.get("purchaser"),
-                date=item.get("date"),
             )
         )
 
-    return comps
+    return comps, items
 
 
 def _extract_occupational_comps(
@@ -735,6 +894,197 @@ def _extract_occupational_comps(
 
 
 # ---------------------------------------------------------------------------
+# Judge / verification functions
+# ---------------------------------------------------------------------------
+
+def _verify_investment_comps(
+    client: anthropic.Anthropic,
+    text: str,
+    comps: list[InvestmentComp],
+    raw_items: list[dict],
+    model: str,
+) -> list[InvestmentComp]:
+    """Verify extracted investment comps against the original brochure text.
+
+    Uses a cheaper/faster model as a 'judge' to cross-check each comparable
+    against the source material. Prompt caching means the brochure text
+    (already cached from the extractor call) costs only 10% of normal input.
+
+    Parameters
+    ----------
+    client : anthropic.Anthropic
+        Anthropic API client.
+    text : str
+        Original brochure text (same as passed to extractor).
+    comps : list[InvestmentComp]
+        Extracted comparables from the extractor.
+    raw_items : list[dict]
+        Raw JSON items (with 'evidence' field) from the extractor response.
+    model : str
+        Model to use for verification (e.g. claude-haiku-4-5).
+
+    Returns
+    -------
+    list[InvestmentComp]
+        Filtered list with hallucinations removed.
+    """
+    if not comps:
+        return comps
+
+    comps_json = json.dumps(raw_items, indent=2)
+    prompt = _INVESTMENT_COMPS_JUDGE_PROMPT.format(text=text, comps_json=comps_json)
+
+    try:
+        message = client.messages.create(
+            model=model,
+            max_tokens=1500,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+            }],
+        )
+
+        response_text = _strip_code_block(message.content[0].text.strip())
+        verdicts_data = json.loads(response_text)
+
+        verdicts = verdicts_data.get("verdicts", [])
+        if not verdicts:
+            logger.warning("  Judge returned no verdicts — keeping all comps")
+            return comps
+
+        # Build removal set
+        remove_indices = set()
+        for v in verdicts:
+            idx = v.get("index")
+            verdict = v.get("verdict", "").lower()
+            reason = v.get("reason", "")
+            if verdict == "remove":
+                remove_indices.add(idx)
+                logger.info("  Judge REMOVED comp %d (%s): %s",
+                           idx, comps[idx].address if idx < len(comps) else "?", reason)
+            else:
+                logger.debug("  Judge kept comp %d: %s", idx, reason)
+
+        if remove_indices:
+            filtered = [c for i, c in enumerate(comps) if i not in remove_indices]
+            logger.info("  Judge: %d/%d comps kept (%d removed)",
+                       len(filtered), len(comps), len(remove_indices))
+            return filtered
+        else:
+            logger.info("  Judge: all %d comps verified", len(comps))
+            return comps
+
+    except Exception as e:
+        logger.warning("  Judge verification failed (%s) — keeping all comps", e)
+        return comps
+
+
+def _verify_investment_comps_vision(
+    client: anthropic.Anthropic,
+    page_images: list[bytes],
+    comps: list[InvestmentComp],
+    raw_items: list[dict],
+    model: str,
+) -> list[InvestmentComp]:
+    """Verify extracted investment comps against the original brochure page images.
+
+    Vision-mode judge: sends the same page images + the extracted JSON to a
+    cheaper model for cross-checking. Prompt caching on the images means the
+    second call costs ~10% of the image input tokens.
+
+    Parameters
+    ----------
+    client : anthropic.Anthropic
+        Anthropic API client.
+    page_images : list[bytes]
+        PNG image bytes for each brochure page.
+    comps : list[InvestmentComp]
+        Extracted comparables from the extractor.
+    raw_items : list[dict]
+        Raw JSON items (with 'evidence' field) from the extractor response.
+    model : str
+        Model to use for verification (e.g. claude-haiku-4-5).
+
+    Returns
+    -------
+    list[InvestmentComp]
+        Filtered list with hallucinations removed.
+    """
+    if not comps:
+        return comps
+
+    comps_json = json.dumps(raw_items, indent=2)
+
+    # Build content blocks: images (cached) + judge prompt with comps JSON
+    blocks: list[dict] = []
+    for png_bytes in page_images:
+        b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": b64,
+            },
+        })
+
+    # Mark the last image block for caching (covers all images)
+    if blocks:
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+    blocks.append({
+        "type": "text",
+        "text": _INVESTMENT_COMPS_JUDGE_VISION_PROMPT + comps_json,
+    })
+
+    try:
+        message = client.messages.create(
+            model=model,
+            max_tokens=1500,
+            temperature=0,
+            messages=[{"role": "user", "content": blocks}],
+        )
+
+        response_text = _strip_code_block(message.content[0].text.strip())
+        verdicts_data = json.loads(response_text)
+
+        verdicts = verdicts_data.get("verdicts", [])
+        if not verdicts:
+            logger.warning("  Judge (vision) returned no verdicts — keeping all comps")
+            return comps
+
+        remove_indices = set()
+        for v in verdicts:
+            idx = v.get("index")
+            verdict = v.get("verdict", "").lower()
+            reason = v.get("reason", "")
+            if verdict == "remove":
+                remove_indices.add(idx)
+                logger.info("  Judge REMOVED comp %d (%s): %s",
+                           idx, comps[idx].address if idx < len(comps) else "?", reason)
+            else:
+                logger.debug("  Judge kept comp %d: %s", idx, reason)
+
+        if remove_indices:
+            filtered = [c for i, c in enumerate(comps) if i not in remove_indices]
+            logger.info("  Judge (vision): %d/%d comps kept (%d removed)",
+                       len(filtered), len(comps), len(remove_indices))
+            return filtered
+        else:
+            logger.info("  Judge (vision): all %d comps verified", len(comps))
+            return comps
+
+    except Exception as e:
+        logger.warning("  Judge (vision) verification failed (%s) — keeping all comps", e)
+        return comps
+
+
+# ---------------------------------------------------------------------------
 # Vision-mode extraction functions (image-based PDFs)
 # ---------------------------------------------------------------------------
 
@@ -779,28 +1129,66 @@ def _extract_investment_comps_vision(
     client: anthropic.Anthropic,
     page_images: list[bytes],
     model: str,
-) -> list[InvestmentComp]:
-    """Extract investment comparables from brochure page images using vision API."""
-    content = _build_vision_content(page_images, _INVESTMENT_COMPS_VISION_PROMPT)
+) -> tuple[list[InvestmentComp], list[dict]]:
+    """Extract investment comparables from brochure page images using vision API.
+
+    Returns
+    -------
+    tuple[list[InvestmentComp], list[dict]]
+        (comps, raw_items) — the raw_items include the 'evidence' field
+        for use by the judge verification step.
+    """
+    # Build content with cache_control on the last image block
+    # so the judge call can reuse the cached images
+    blocks: list[dict] = []
+    for png_bytes in page_images:
+        b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": b64,
+            },
+        })
+
+    # Mark last image for caching (covers all preceding images)
+    if blocks:
+        blocks[-1]["cache_control"] = {"type": "ephemeral"}
+
+    blocks.append({
+        "type": "text",
+        "text": _INVESTMENT_COMPS_VISION_PROMPT,
+    })
 
     message = client.messages.create(
         model=model,
         max_tokens=3000,
-        messages=[{"role": "user", "content": content}],
+        temperature=0,
+        messages=[{"role": "user", "content": blocks}],
     )
 
     response_text = _strip_code_block(message.content[0].text.strip())
     data = json.loads(response_text)
 
-    if not isinstance(data, list):
-        return []
+    # Handle CoVe format {"comparables": [...]} or legacy bare array [...]
+    items = _unwrap_comps_response(data)
+    if items is None:
+        return [], []
 
     comps = []
-    for item in data:
+    for item in items:
+        date_str = item.get("date")
+        evidence = item.get("evidence", "")
+        if evidence:
+            logger.debug("  Evidence (vision): %s", evidence[:120])
         comps.append(
             InvestmentComp(
                 town=item.get("town", ""),
                 address=item.get("address", ""),
+                date=date_str,
+                quarter=_derive_quarter(date_str),
+                style=item.get("style"),
                 units=_to_int(item.get("units")),
                 area_sqft=_to_float(item.get("area_sqft")),
                 rent_pa=_to_float(item.get("rent_pa")),
@@ -812,11 +1200,10 @@ def _extract_investment_comps_vision(
                 capval_psf=_to_float(item.get("capval_psf")),
                 vendor=item.get("vendor"),
                 purchaser=item.get("purchaser"),
-                date=item.get("date"),
             )
         )
 
-    return comps
+    return comps, items
 
 
 def _extract_occupational_comps_vision(
@@ -869,6 +1256,47 @@ def _extract_occupational_comps_vision(
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _derive_quarter(date_str: Optional[str]) -> Optional[str]:
+    """Derive a quarter string (e.g. 'Q1 2025') from a date string.
+
+    Handles formats: DD/MM/YYYY, MM/YYYY, YYYY, or None.
+    """
+    if not date_str or not isinstance(date_str, str):
+        return None
+
+    date_str = date_str.strip()
+    month = None
+    year = None
+
+    # DD/MM/YYYY
+    parts = date_str.split("/")
+    if len(parts) == 3:
+        try:
+            month = int(parts[1])
+            year = int(parts[2])
+        except (ValueError, IndexError):
+            pass
+    # MM/YYYY
+    elif len(parts) == 2:
+        try:
+            month = int(parts[0])
+            year = int(parts[1])
+        except (ValueError, IndexError):
+            pass
+    # Just a year (e.g. "2025")
+    elif len(date_str) == 4 and date_str.isdigit():
+        year = int(date_str)
+
+    if year is None:
+        return None
+
+    if month is None:
+        return None  # Can't determine quarter without month
+
+    quarter = (month - 1) // 3 + 1
+    return f"Q{quarter} {year}"
+
+
 def _strip_code_block(text: str) -> str:
     """Strip markdown code block markers from text."""
     if text.startswith("```"):
@@ -876,6 +1304,25 @@ def _strip_code_block(text: str) -> str:
         json_lines = [l for l in lines if not l.strip().startswith("```")]
         return "\n".join(json_lines)
     return text
+
+
+def _unwrap_comps_response(data) -> Optional[list]:
+    """Unwrap the Chain-of-Verify response format.
+
+    Handles both:
+    - CoVe format: {"comparables": [...]}
+    - Legacy bare array: [...]
+
+    Returns the list of comparable items, or None if invalid.
+    """
+    if isinstance(data, list):
+        # Legacy format — bare array
+        return data
+    if isinstance(data, dict):
+        comps = data.get("comparables")
+        if isinstance(comps, list):
+            return comps
+    return None
 
 
 def _clean_str(value) -> str:

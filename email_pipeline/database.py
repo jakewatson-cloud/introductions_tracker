@@ -75,6 +75,26 @@ class Database:
                 ON processed_emails(processed_at)
             """)
 
+            # Scraped brochures — tracks which files have been parsed for comps
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS scraped_brochures (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    file_modified TEXT,
+                    deal_name TEXT,
+                    scraped_at TEXT NOT NULL,
+                    investment_comps_found INTEGER DEFAULT 0,
+                    occupational_comps_found INTEGER DEFAULT 0,
+                    UNIQUE(file_path, file_size)
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_scraped_file_path
+                ON scraped_brochures(file_path)
+            """)
+
             conn.commit()
 
     def is_processed(self, gmail_message_id: str) -> bool:
@@ -257,3 +277,99 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Scraped brochures tracking
+    # ------------------------------------------------------------------
+
+    def is_brochure_scraped(self, file_path: str, file_size: int) -> bool:
+        """Check if a brochure file has already been scraped for comps.
+
+        Matches on file_path + file_size.  A changed size means the file
+        was modified and should be re-processed.
+
+        Parameters
+        ----------
+        file_path : str
+            Absolute path to the brochure file.
+        file_size : int
+            File size in bytes.
+
+        Returns
+        -------
+        bool
+            True if this exact file has already been scraped.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            result = conn.execute(
+                "SELECT 1 FROM scraped_brochures WHERE file_path = ? AND file_size = ?",
+                (file_path, file_size),
+            ).fetchone()
+            return result is not None
+
+    def mark_brochure_scraped(
+        self,
+        file_path: str,
+        file_name: str,
+        file_size: int,
+        file_modified: str = "",
+        deal_name: str = "",
+        investment_comps_found: int = 0,
+        occupational_comps_found: int = 0,
+    ) -> None:
+        """Record a brochure file as scraped.
+
+        Parameters
+        ----------
+        file_path : str
+            Absolute path to the brochure file.
+        file_name : str
+            Just the filename (e.g. "brochure.pdf").
+        file_size : int
+            File size in bytes.
+        file_modified : str
+            ISO timestamp of the file's last modification time.
+        deal_name : str
+            Source deal name (e.g. "Birmingham, Kings Road").
+        investment_comps_found : int
+            Number of investment comps extracted.
+        occupational_comps_found : int
+            Number of occupational comps extracted.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO scraped_brochures (
+                    file_path, file_name, file_size, file_modified,
+                    deal_name, scraped_at,
+                    investment_comps_found, occupational_comps_found
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_path,
+                    file_name,
+                    file_size,
+                    file_modified,
+                    deal_name,
+                    datetime.now().isoformat(),
+                    investment_comps_found,
+                    occupational_comps_found,
+                ),
+            )
+            conn.commit()
+
+    def clear_scraped_brochures(self) -> int:
+        """Delete all scraped_brochures records.
+
+        Returns
+        -------
+        int
+            Number of records deleted.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM scraped_brochures"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM scraped_brochures")
+            conn.commit()
+            return count

@@ -382,30 +382,38 @@ class PipelineWriter:
 class InvestmentCompsWriter:
     """Writes investment comparables to INVESTMENT COMPARABLES MASTER.xlsx.
 
-    Schema ("2026 Data" sheet):
-        B=Town, C=Address, D=Units, E=Area, F=Rent(pa), G=Rent(psf),
-        H=AWULTC, I=Price, J=Yield(NIY), K=RY, L=Cap Val psf,
-        M=Vendor, N=Purchaser, O=Date
+    Schema ("2026 Data" sheet, headers row 2, data from row 3):
+        B=Date, C=Quarter, D=Town, E=Style, F=Address, G=Units,
+        H=Area, I=Rent(pa), J=Rent(psf), K=AWULTC, L=Price,
+        M=Yield(NIY), N=RY, O=Cap Val psf, P=Vendor, Q=Purchaser,
+        R=Comment, S=Information Source, T=Link
     """
 
     SHEET_NAME = "2026 Data"
+    HEADER_ROW = 2
+    DATA_START_ROW = 3
 
-    # Column mapping (1-indexed)
+    # Column mapping (1-indexed) — matches actual spreadsheet layout
     COLUMNS = {
-        "town": 2,                # B
-        "address": 3,             # C
-        "units": 4,               # D
-        "area_sqft": 5,           # E
-        "rent_pa": 6,             # F
-        "rent_psf": 7,            # G
-        "awultc": 8,              # H
-        "price": 9,               # I
-        "yield_niy": 10,          # J
-        "reversionary_yield": 11, # K
-        "capval_psf": 12,         # L
-        "vendor": 13,             # M
-        "purchaser": 14,          # N
-        "date": 15,               # O
+        "date": 2,                # B
+        "quarter": 3,             # C
+        "town": 4,                # D
+        "style": 5,               # E
+        "address": 6,             # F
+        "units": 7,               # G
+        "area_sqft": 8,           # H
+        "rent_pa": 9,             # I
+        "rent_psf": 10,           # J
+        "awultc": 11,             # K
+        "price": 12,              # L
+        "yield_niy": 13,          # M
+        "reversionary_yield": 14, # N
+        "capval_psf": 15,         # O
+        "vendor": 16,             # P
+        "purchaser": 17,          # Q
+        "comment": 18,            # R
+        "source_deal": 19,        # S — Information Source
+        "source_file_path": 20,   # T — Link
     }
 
     def __init__(self, excel_path: Path):
@@ -448,12 +456,40 @@ class InvestmentCompsWriter:
             return count[0] > 0
 
         _retry_write(self.excel_path, _write)
+
+        # Post-write cleaning pass: fill gaps using arithmetic relationships
+        if count[0] > 0:
+            try:
+                from email_pipeline.comps_cleaner import clean_investment_comps
+
+                summary = clean_investment_comps(self.excel_path)
+                if summary["cells_filled"] > 0:
+                    logger.info(
+                        "  Comps cleaner filled %d cells", summary["cells_filled"]
+                    )
+            except Exception as e:
+                logger.warning("  Comps cleaner failed: %s", e)
+
         return count[0]
 
     def _write_comp(self, ws, row: int, comp: InvestmentComp):
         """Write a single comp to a row."""
         col = self.COLUMNS
+
+        # Copy formatting from the previous data row
+        format_row = row - 1 if row > self.DATA_START_ROW else self.DATA_START_ROW
+        self._copy_row_format(ws, format_row, row)
+
+        if comp.date:
+            ws.cell(row=row, column=col["date"], value=comp.date)
+        if comp.quarter:
+            ws.cell(row=row, column=col["quarter"], value=comp.quarter)
+
         ws.cell(row=row, column=col["town"], value=comp.town)
+
+        if comp.style:
+            ws.cell(row=row, column=col["style"], value=comp.style)
+
         ws.cell(row=row, column=col["address"], value=comp.address)
 
         if comp.units is not None:
@@ -478,17 +514,21 @@ class InvestmentCompsWriter:
             ws.cell(row=row, column=col["vendor"], value=comp.vendor)
         if comp.purchaser:
             ws.cell(row=row, column=col["purchaser"], value=comp.purchaser)
-        if comp.date:
-            ws.cell(row=row, column=col["date"], value=comp.date)
+        if comp.comment:
+            ws.cell(row=row, column=col["comment"], value=comp.comment)
+        if comp.source_deal:
+            ws.cell(row=row, column=col["source_deal"], value=comp.source_deal)
+        if comp.source_file_path:
+            ws.cell(row=row, column=col["source_file_path"], value=comp.source_file_path)
 
     def _is_duplicate(self, ws, comp: InvestmentComp) -> bool:
         """Check if a comp already exists (match on address + town)."""
-        col_b = self.COLUMNS["town"]
-        col_c = self.COLUMNS["address"]
+        col_town = self.COLUMNS["town"]
+        col_addr = self.COLUMNS["address"]
 
-        for row in range(2, ws.max_row + 1):
-            existing_town = str(ws.cell(row=row, column=col_b).value or "").strip().lower()
-            existing_addr = str(ws.cell(row=row, column=col_c).value or "").strip().lower()
+        for row in range(self.DATA_START_ROW, ws.max_row + 1):
+            existing_town = str(ws.cell(row=row, column=col_town).value or "").strip().lower()
+            existing_addr = str(ws.cell(row=row, column=col_addr).value or "").strip().lower()
 
             if not existing_addr:
                 continue
@@ -502,12 +542,24 @@ class InvestmentCompsWriter:
         return False
 
     def _find_next_row(self, ws) -> int:
-        """Find the next empty row (scanning column C = address)."""
-        col_c = self.COLUMNS["address"]
-        for row in range(2, ws.max_row + 100):
-            if not ws.cell(row=row, column=col_c).value:
+        """Find the next empty row (scanning column F = address)."""
+        col_addr = self.COLUMNS["address"]
+        for row in range(self.DATA_START_ROW, ws.max_row + 100):
+            if not ws.cell(row=row, column=col_addr).value:
                 return row
         return ws.max_row + 1
+
+    def _copy_row_format(self, ws, source_row: int, target_row: int):
+        """Copy cell formatting from source row to target row."""
+        for col in range(2, 21):  # B to T
+            source_cell = ws.cell(row=source_row, column=col)
+            target_cell = ws.cell(row=target_row, column=col)
+            if source_cell.has_style:
+                target_cell.font = copy(source_cell.font)
+                target_cell.number_format = copy(source_cell.number_format)
+                target_cell.alignment = copy(source_cell.alignment)
+                target_cell.border = copy(source_cell.border)
+                target_cell.fill = copy(source_cell.fill)
 
 
 # ---------------------------------------------------------------------------
