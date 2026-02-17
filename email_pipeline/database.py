@@ -95,6 +95,43 @@ class Database:
                 ON scraped_brochures(file_path)
             """)
 
+            # Cleaned occupational comparables — output of the cleaning pipeline
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cleaned_occupational_comps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_deal TEXT NOT NULL,
+                    source_file_path TEXT,
+                    entry_type TEXT NOT NULL DEFAULT 'tenancy',
+                    tenant_name TEXT,
+                    unit_name TEXT,
+                    address TEXT,
+                    town TEXT,
+                    postcode TEXT,
+                    total_address TEXT,
+                    size_sqft REAL,
+                    rent_pa REAL,
+                    rent_psf REAL,
+                    lease_start TEXT,
+                    lease_expiry TEXT,
+                    break_date TEXT,
+                    rent_review_date TEXT,
+                    lease_term_years REAL,
+                    comp_date TEXT,
+                    notes TEXT,
+                    extraction_date TEXT,
+                    cleaned_at TEXT NOT NULL,
+                    UNIQUE(source_deal, entry_type, tenant_name, address, unit_name, rent_pa)
+                )
+            """)
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_town ON cleaned_occupational_comps(town)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_postcode ON cleaned_occupational_comps(postcode)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_comp_date ON cleaned_occupational_comps(comp_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_entry_type ON cleaned_occupational_comps(entry_type)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_rent_psf ON cleaned_occupational_comps(rent_psf)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_size ON cleaned_occupational_comps(size_sqft)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_source_deal ON cleaned_occupational_comps(source_deal)")
+
             conn.commit()
 
     def is_processed(self, gmail_message_id: str) -> bool:
@@ -371,5 +408,32 @@ class Database:
                 "SELECT COUNT(*) FROM scraped_brochures"
             ).fetchone()[0]
             conn.execute("DELETE FROM scraped_brochures")
+            conn.commit()
+            return count
+
+    # ------------------------------------------------------------------
+    # Cleaned occupational comps
+    # ------------------------------------------------------------------
+
+    def get_cleaned_occ_comps_count(self) -> int:
+        """Return number of cleaned occupational comps in the database."""
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM cleaned_occupational_comps"
+            ).fetchone()[0]
+
+    def clear_cleaned_occ_comps(self) -> int:
+        """Delete all cleaned_occupational_comps rows.
+
+        Returns
+        -------
+        int
+            Number of records deleted.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM cleaned_occupational_comps"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM cleaned_occupational_comps")
             conn.commit()
             return count

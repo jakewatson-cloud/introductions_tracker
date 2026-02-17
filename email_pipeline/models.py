@@ -61,7 +61,7 @@ class InvestmentComp:
     town: str                                  # D
     address: str                               # F
     date: Optional[str] = None                 # B — transaction date
-    quarter: Optional[str] = None              # C — e.g. "Q1 2025"
+    quarter: Optional[str] = None              # C — e.g. "2025 Q1"
     style: Optional[str] = None                # E — "Multi-Let", "Single-Let", etc.
     units: Optional[int] = None                # G
     area_sqft: Optional[float] = None          # H
@@ -81,10 +81,16 @@ class InvestmentComp:
 
 @dataclass
 class OccupationalComp:
-    """Letting / occupational comparable from brochure tenancy schedules."""
+    """Letting / occupational comparable from brochure tenancy schedules and rental evidence.
+
+    Two entry types:
+        - "tenancy"    — the subject property's own current leases (from tenancy schedules)
+        - "comparable" — recent lettings at OTHER properties, used as benchmarking evidence
+    """
 
     source_deal: str
-    tenant_name: str
+    tenant_name: str                               # Tenant name (null/empty for rental comparables)
+    entry_type: str = "tenancy"                    # "tenancy" or "comparable"
     unit_name: Optional[str] = None
     address: str = ""
     town: str = ""
@@ -97,7 +103,9 @@ class OccupationalComp:
     break_date: Optional[str] = None
     rent_review_date: Optional[str] = None
     lease_term_years: Optional[float] = None
+    comp_date: Optional[str] = None                # Transaction date for rental comparables
     notes: Optional[str] = None
+    source_file_path: Optional[str] = None         # Filesystem path to source brochure
 
 
 @dataclass

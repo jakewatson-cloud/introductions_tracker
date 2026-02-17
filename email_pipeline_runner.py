@@ -43,6 +43,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from config import (
     get_anthropic_api_key,
+    get_cleaned_occupational_comps_path,
     get_db_path,
     get_email_keywords,
     get_gmail_credentials_path,
@@ -322,6 +323,36 @@ def cmd_parse_brochure(args):
                 writer = OccupationalCompsWriter(occ_path)
                 count = writer.append_comps(result.occupational_comps)
                 print(f"    ✓ {count} occupational comps written to {occ_path.name}")
+
+        # Post-write: backup, snapshot, clean (once per run)
+        from email_pipeline.excel_writer import _backup_file
+
+        if result.investment_comps:
+            inv_path = get_investment_comps_path()
+            if inv_path and inv_path.exists():
+                _backup_file(inv_path)
+
+        if result.occupational_comps:
+            occ_path = get_occupational_comps_path()
+            if occ_path and occ_path.exists():
+                _backup_file(occ_path)
+                try:
+                    from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
+                    snapshot_raw_csv(occ_path)
+                except Exception:
+                    pass
+                try:
+                    from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+                    cleaned_path = get_cleaned_occupational_comps_path()
+                    db_path = get_db_path()
+                    if cleaned_path:
+                        clean_occupational_comps(
+                            raw_excel_path=occ_path,
+                            cleaned_excel_path=cleaned_path,
+                            db_path=db_path,
+                        )
+                except Exception as e:
+                    print(f"    ⚠ Occ comps cleaner failed: {e}")
 
     if not result.investment_comps and not result.occupational_comps and not result.deal_extraction:
         print("\n  No data extracted from this file.")

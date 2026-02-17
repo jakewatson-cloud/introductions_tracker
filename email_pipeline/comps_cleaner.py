@@ -231,8 +231,12 @@ def _to_number(value) -> float | None:
 
 
 def _is_quarter_string(value: str) -> bool:
-    """Check if a string is a quarter reference like 'Q2 2025'."""
-    return bool(re.match(r"^Q[1-4]\s*[-/]?\s*\d{4}$", value.strip(), re.IGNORECASE))
+    """Check if a string is a quarter reference like '2025 Q2' or 'Q2 2025'."""
+    s = value.strip()
+    return bool(
+        re.match(r"^\d{4}\s*Q[1-4]$", s, re.IGNORECASE)
+        or re.match(r"^Q[1-4]\s*[-/]?\s*\d{4}$", s, re.IGNORECASE)
+    )
 
 
 def _derive_quarter_from_cell(value) -> str | None:
@@ -240,9 +244,9 @@ def _derive_quarter_from_cell(value) -> str | None:
 
     Handles:
     - datetime objects (openpyxl may deserialise date cells)
-    - "Q2 2025" or "Q2-2025" → "Q2 2025" (normalised)
-    - "15/03/2025"            → "Q1 2025"
-    - "03/2025"               → "Q1 2025"
+    - "2025 Q2" or "Q2 2025" or "Q2-2025" → "2025 Q2" (normalised)
+    - "15/03/2025"            → "2025 Q1"
+    - "03/2025"               → "2025 Q1"
     """
     if value is None:
         return None
@@ -250,7 +254,7 @@ def _derive_quarter_from_cell(value) -> str | None:
     # Handle datetime objects
     if isinstance(value, datetime):
         quarter = (value.month - 1) // 3 + 1
-        return f"Q{quarter} {value.year}"
+        return f"{value.year} Q{quarter}"
 
     if not isinstance(value, str):
         return None
@@ -259,10 +263,15 @@ def _derive_quarter_from_cell(value) -> str | None:
     if not value:
         return None
 
-    # Quarter string: "Q2 2025", "Q2-2025", "Q2/2025"
+    # New format: "2025 Q2"
+    m = re.match(r"^(\d{4})\s*Q([1-4])$", value, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} Q{m.group(2)}"
+
+    # Old format: "Q2 2025", "Q2-2025", "Q2/2025"
     m = re.match(r"^Q([1-4])\s*[-/]?\s*(\d{4})$", value, re.IGNORECASE)
     if m:
-        return f"Q{m.group(1)} {m.group(2)}"
+        return f"{m.group(2)} Q{m.group(1)}"
 
     # DD/MM/YYYY
     parts = value.split("/")
@@ -272,7 +281,7 @@ def _derive_quarter_from_cell(value) -> str | None:
             year = int(parts[2])
             if 1 <= month <= 12 and 2000 <= year <= 2100:
                 quarter = (month - 1) // 3 + 1
-                return f"Q{quarter} {year}"
+                return f"{year} Q{quarter}"
         except (ValueError, IndexError):
             pass
 
@@ -283,7 +292,7 @@ def _derive_quarter_from_cell(value) -> str | None:
             year = int(parts[1])
             if 1 <= month <= 12 and 2000 <= year <= 2100:
                 quarter = (month - 1) // 3 + 1
-                return f"Q{quarter} {year}"
+                return f"{year} Q{quarter}"
         except (ValueError, IndexError):
             pass
 

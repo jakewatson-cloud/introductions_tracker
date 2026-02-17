@@ -87,3 +87,15 @@ def get_occupational_comps_path() -> Path | None:
     if inv_path:
         return inv_path.parent / "OCCUPATIONAL COMPARABLES.xlsx"
     return None
+
+
+def get_cleaned_occupational_comps_path() -> Path | None:
+    """Return the path to the cleaned Occupational Comparables Excel."""
+    raw = os.environ.get("CLEANED_OCCUPATIONAL_COMPS_PATH")
+    if raw:
+        return Path(raw)
+    # Default: same folder as raw occ comps, with " - CLEANED" suffix
+    occ_path = get_occupational_comps_path()
+    if occ_path:
+        return occ_path.parent / "OCCUPATIONAL COMPARABLES - CLEANED.xlsx"
+    return None

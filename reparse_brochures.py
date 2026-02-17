@@ -36,6 +36,33 @@ logger = logging.getLogger(__name__)
 BROCHURE_SUFFIXES = {".pdf", ".xlsx", ".xls"}
 SKIP_FILES = {"metadata.json", "email_body.txt"}
 
+# Filename patterns (case-insensitive substrings) that indicate a file is a
+# financial model or appraisal rather than a brochure.  These waste API calls
+# because they contain assumptions / derived numbers, not factual comps.
+_SKIP_PATTERNS = [
+    "model",
+    "appraisal",
+    "cashflow",
+    "cash flow",
+    "cash_flow",
+    "underwriting",
+    "proforma",
+    "pro forma",
+    "pro-forma",
+    "forecast",
+    "budget",
+    "valuation",
+    "sensitivity",
+    "irr analysis",
+    "dcf",
+]
+
+
+def _is_financial_model(filename: str) -> bool:
+    """Return True if the filename looks like a financial model, not a brochure."""
+    lower = filename.lower()
+    return any(pat in lower for pat in _SKIP_PATTERNS)
+
 
 def discover_brochures(archive_root: Path) -> list[tuple[str, Path]]:
     """Walk archive and return (source_deal_name, brochure_path) pairs."""
@@ -57,6 +84,7 @@ def discover_brochures(archive_root: Path) -> list[tuple[str, Path]]:
                     f.is_file()
                     and f.suffix.lower() in BROCHURE_SUFFIXES
                     and f.name not in SKIP_FILES
+                    and not _is_financial_model(f.name)
                 ):
                     results.append((deal_name, f))
 
@@ -108,23 +136,40 @@ def clear_pipeline_comps(inv_path: Path, occ_path: Path) -> None:
         except Exception as e:
             print(f"  WARNING: Could not clear investment comps: {e}")
 
-    # --- Occupational comps: delete and recreate ---
+    # --- Occupational comps: clear rows in-place and rewrite headers ---
+    # We do NOT delete the file because OneDrive can race: it sees the
+    # delete, then overwrites the newly-created file with the deletion.
+    # Instead, clear all data rows and overwrite headers so the column
+    # layout always matches the current code.
     if occ_path.exists():
         try:
             wb = openpyxl.load_workbook(str(occ_path), data_only=False)
             ws = wb.active
-            old_count = max(0, ws.max_row - 1)  # minus header
+            old_count = max(0, ws.max_row - 1)
 
-            # Clear all data rows (keep header row 1)
+            # Clear all data rows
             for row in range(2, ws.max_row + 1):
-                for col in range(1, 17):
+                for col in range(1, ws.max_column + 1):
                     ws.cell(row=row, column=col).value = None
+
+            # Overwrite headers to match current column layout
+            from email_pipeline.excel_writer import OccupationalCompsWriter
+            from openpyxl.styles import Font
+            for i, header in enumerate(OccupationalCompsWriter.HEADERS, 1):
+                cell = ws.cell(row=1, column=i, value=header)
+                cell.font = Font(bold=True)
+            # Clear any extra old header columns beyond current layout
+            for col in range(len(OccupationalCompsWriter.HEADERS) + 1, ws.max_column + 1):
+                ws.cell(row=1, column=col).value = None
 
             wb.save(str(occ_path))
             wb.close()
-            print(f"  Cleared {old_count} occupational comp rows")
+            print(f"  Cleared {old_count} occupational comp rows (headers updated)")
         except Exception as e:
             print(f"  WARNING: Could not clear occupational comps: {e}")
+    else:
+        # File doesn't exist yet — the OccupationalCompsWriter will create it
+        print("  Occupational comps file does not exist — will be created on first write")
 
 
 def main():
@@ -237,6 +282,8 @@ def main():
                 all_inv_comps.extend(result.investment_comps)
                 print(f"    ✓ {len(result.investment_comps)} investment comps")
             if result.occupational_comps:
+                for comp in result.occupational_comps:
+                    comp.source_file_path = str(path)
                 all_occ_comps.extend(result.occupational_comps)
                 print(f"    ✓ {len(result.occupational_comps)} occupational comps")
             if result.error_message:
@@ -277,6 +324,36 @@ def main():
         writer = OccupationalCompsWriter(occ_path)
         occ_written = writer.append_comps(all_occ_comps)
         print(f"  Occupational comps written: {occ_written} (of {len(all_occ_comps)} extracted)")
+
+    # Post-write: backup, snapshot, clean (once per run)
+    from email_pipeline.excel_writer import _backup_file
+
+    if inv_written > 0 and inv_path and inv_path.exists():
+        _backup_file(inv_path)
+
+    if occ_written > 0 and occ_path and occ_path.exists():
+        _backup_file(occ_path)
+        try:
+            from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
+            snapshot_raw_csv(occ_path)
+        except Exception as e:
+            print(f"  ⚠ CSV snapshot failed: {e}")
+        try:
+            from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+            from config import get_cleaned_occupational_comps_path, get_db_path
+            cleaned_path = get_cleaned_occupational_comps_path()
+            db_path = get_db_path()
+            if cleaned_path:
+                summary = clean_occupational_comps(
+                    raw_excel_path=occ_path,
+                    cleaned_excel_path=cleaned_path,
+                    db_path=db_path,
+                )
+                filled = summary.get("cells_filled", 0)
+                db_rows = summary.get("db_rows", 0)
+                print(f"  Cleaner: {filled} cells filled, {db_rows} rows in DB")
+        except Exception as e:
+            print(f"  ⚠ Occ comps cleaner failed: {e}")
 
     # Summary
     print()

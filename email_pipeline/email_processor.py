@@ -476,6 +476,50 @@ def process_emails(
                 )
 
     # -----------------------------------------------------------------------
+    # Step 5b: Post-run backups, snapshots, and cleaning (once per run)
+    # -----------------------------------------------------------------------
+    # Backup each Excel file ONCE (not per-email)
+    from email_pipeline.excel_writer import _backup_file
+
+    if pipeline_excel_path and pipeline_excel_path.exists() and report.pipeline_rows_added > 0:
+        _backup_file(pipeline_excel_path)
+
+    if investment_comps_path and investment_comps_path.exists() and report.investment_comps_added > 0:
+        _backup_file(investment_comps_path)
+
+    if occupational_comps_path and occupational_comps_path.exists() and report.occupational_comps_added > 0:
+        _backup_file(occupational_comps_path)
+
+        # CSV snapshot + cleaning pass for occ comps (once per run)
+        try:
+            from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
+            snapshot_raw_csv(occupational_comps_path)
+        except Exception as e:
+            logger.warning("  CSV snapshot failed: %s", e)
+
+        try:
+            from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+            from config import get_cleaned_occupational_comps_path, get_db_path
+
+            cleaned_path = get_cleaned_occupational_comps_path()
+            db_path = get_db_path()
+            if cleaned_path:
+                summary = clean_occupational_comps(
+                    raw_excel_path=occupational_comps_path,
+                    cleaned_excel_path=cleaned_path,
+                    db_path=db_path,
+                )
+                if summary.get("cells_filled", 0) > 0:
+                    print(f"  Cleaner: filled {summary['cells_filled']} cells, "
+                          f"{summary['db_rows']} rows in DB")
+                else:
+                    print(f"  Cleaner: no gaps to fill, "
+                          f"{summary['db_rows']} rows in DB")
+        except Exception as e:
+            logger.warning("  Occ comps cleaner failed: %s", e)
+            print(f"  ⚠ Occ comps cleaner failed: {e}")
+
+    # -----------------------------------------------------------------------
     # Step 6: Final report
     # -----------------------------------------------------------------------
     print(f"\n[Step 6/6] Processing complete!")
@@ -697,6 +741,9 @@ def _process_thread(
                             if br.investment_comps:
                                 for comp in br.investment_comps:
                                     comp.source_deal = f"{primary_deal.town}, {primary_deal.asset_name}"
+                                    comp.source_file_path = str(bp)
+                            if br.occupational_comps:
+                                for comp in br.occupational_comps:
                                     comp.source_file_path = str(bp)
                             result.investment_comps.extend(br.investment_comps)
                             result.occupational_comps.extend(br.occupational_comps)

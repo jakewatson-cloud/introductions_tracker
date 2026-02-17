@@ -705,6 +705,13 @@ class BrochureTab(ttk.Frame):
     _BROCHURE_SUFFIXES = {".pdf", ".xlsx", ".xls"}
     _SKIP_FILES = {"metadata.json", "email_body.txt"}
 
+    # Filename patterns (case-insensitive) that indicate financial models, not brochures
+    _SKIP_PATTERNS = [
+        "model", "appraisal", "cashflow", "cash flow", "cash_flow",
+        "underwriting", "proforma", "pro forma", "pro-forma", "forecast",
+        "budget", "valuation", "sensitivity", "irr analysis", "dcf",
+    ]
+
     def __init__(self, parent, app: "PipelineGUI"):
         super().__init__(parent, padding=12)
         self.app = app
@@ -765,6 +772,9 @@ class BrochureTab(ttk.Frame):
         row.pack(fill="x", pady=(0, 8))
         self.parse_btn = ttk.Button(row, text="Parse", command=self._on_parse)
         self.parse_btn.pack(side="left")
+        self.clean_btn = ttk.Button(row, text="Clean Occ Comps",
+                                     command=self._on_clean_comps)
+        self.clean_btn.pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(row, textvariable=self.status_var).pack(side="right")
 
@@ -870,6 +880,9 @@ class BrochureTab(ttk.Frame):
                 if fpath.suffix.lower() not in brochure_exts:
                     continue
                 if fpath.name in skip:
+                    continue
+                # Skip financial models — they waste API calls
+                if any(pat in fname.lower() for pat in self._SKIP_PATTERNS):
                     continue
 
                 # Derive source deal name from folder structure:
@@ -996,6 +1009,8 @@ class BrochureTab(ttk.Frame):
                         all_inv.extend(result.investment_comps)
                         print(f"    {len(result.investment_comps)} investment comps")
                     if result.occupational_comps:
+                        for comp in result.occupational_comps:
+                            comp.source_file_path = str(path)
                         all_occ.extend(result.occupational_comps)
                         print(f"    {len(result.occupational_comps)} occupational comps")
                     if result.error_message:
@@ -1033,7 +1048,47 @@ class BrochureTab(ttk.Frame):
             if write_excel and all_occ:
                 occ_path = cfg.get_occupational_comps_path()
                 if occ_path:
+                    print(f"\n  Passing {len(all_occ)} occ comps to writer...")
                     occ_written = OccupationalCompsWriter(occ_path).append_comps(all_occ)
+                    print(f"  Writer returned: {occ_written} written")
+
+            # --- Post-write: backup, snapshot, clean (once per run) ---
+            from email_pipeline.excel_writer import _backup_file
+
+            if write_excel and inv_written > 0:
+                inv_path = cfg.get_investment_comps_path()
+                if inv_path and inv_path.exists():
+                    _backup_file(inv_path)
+
+            if write_excel and occ_written > 0 and occ_path and occ_path.exists():
+                _backup_file(occ_path)
+
+                try:
+                    from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
+                    snapshot_raw_csv(occ_path)
+                except Exception as e:
+                    print(f"  ⚠ CSV snapshot failed: {e}")
+
+                try:
+                    from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+                    from config import get_cleaned_occupational_comps_path, get_db_path
+
+                    cleaned_path = get_cleaned_occupational_comps_path()
+                    db_path = get_db_path()
+                    if cleaned_path:
+                        summary = clean_occupational_comps(
+                            raw_excel_path=occ_path,
+                            cleaned_excel_path=cleaned_path,
+                            db_path=db_path,
+                        )
+                        if summary.get("cells_filled", 0) > 0:
+                            print(f"  Cleaner: filled {summary['cells_filled']} cells, "
+                                  f"{summary['db_rows']} rows in DB")
+                        else:
+                            print(f"  Cleaner: no gaps to fill, "
+                                  f"{summary['db_rows']} rows in DB")
+                except Exception as e:
+                    print(f"  ⚠ Occ comps cleaner failed: {e}")
 
             # --- Summary ---
             print()
@@ -1146,15 +1201,99 @@ class BrochureTab(ttk.Frame):
             if inv_path and inv_path.exists():
                 count = InvestmentCompsWriter(inv_path).append_comps(result.investment_comps)
                 written.append(f"{count} investment comps -> {inv_path.name}")
+                if count > 0:
+                    from email_pipeline.excel_writer import _backup_file
+                    _backup_file(inv_path)
 
         if result.occupational_comps:
             occ_path = cfg.get_occupational_comps_path()
             if occ_path:
                 count = OccupationalCompsWriter(occ_path).append_comps(result.occupational_comps)
                 written.append(f"{count} occupational comps -> {occ_path.name}")
+                if count > 0:
+                    from email_pipeline.excel_writer import _backup_file
+                    _backup_file(occ_path)
+                    try:
+                        from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
+                        snapshot_raw_csv(occ_path)
+                    except Exception:
+                        pass
+                    try:
+                        from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+                        from config import get_cleaned_occupational_comps_path, get_db_path
+                        cleaned_path = get_cleaned_occupational_comps_path()
+                        db_path = get_db_path()
+                        if cleaned_path:
+                            clean_occupational_comps(
+                                raw_excel_path=occ_path,
+                                cleaned_excel_path=cleaned_path,
+                                db_path=db_path,
+                            )
+                    except Exception:
+                        pass
 
         if written:
             self._append_result("\n\nExcel writes:\n  " + "\n  ".join(written))
+
+    # ── Clean occ comps ─────────────────────────────────────────────
+
+    def _on_clean_comps(self):
+        """Run the occupational comps cleaning pipeline standalone."""
+        occ_path = cfg.get_occupational_comps_path()
+        if not occ_path or not occ_path.exists():
+            messagebox.showwarning(
+                "No Data",
+                "Occupational comparables file not found.\n"
+                "Parse some brochures with 'Write results to Excel files' first.",
+            )
+            return
+
+        self.clean_btn.config(state="disabled")
+        self.status_var.set("Cleaning occ comps...")
+        self._clear_results()
+
+        from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+
+        cleaned_path = cfg.get_cleaned_occupational_comps_path()
+        db_path = cfg.get_db_path()
+
+        def worker():
+            return clean_occupational_comps(
+                raw_excel_path=occ_path,
+                cleaned_excel_path=cleaned_path,
+                db_path=db_path,
+            )
+
+        run_in_thread(worker, self._result_queue, log_queue=self._log_queue)
+        self._poll_clean_result()
+
+    def _poll_clean_result(self):
+        self._poll_log()
+        try:
+            status, data = self._result_queue.get_nowait()
+            self.clean_btn.config(state="normal")
+            if status == "success":
+                summary = data
+                self._append_result(
+                    f"\n{'=' * 40}\n"
+                    f"Cleaning Summary\n"
+                    f"{'=' * 40}\n"
+                    f"  Rows scanned:  {summary['rows_scanned']}\n"
+                    f"  Cells filled:  {summary['cells_filled']}\n"
+                    f"  DB rows:       {summary['db_rows']}\n"
+                )
+                if summary["details"]:
+                    self._append_result(
+                        f"\nDetails ({len(summary['details'])} changes):\n"
+                    )
+                    for detail in summary["details"]:
+                        self._append_result(f"  {detail}\n")
+                self.status_var.set("Cleaning complete")
+            else:
+                self.status_var.set("Error")
+                messagebox.showerror("Clean Error", str(data))
+        except queue.Empty:
+            self.after(150, self._poll_clean_result)
 
     # ── helpers ──────────────────────────────────────────────────────
 

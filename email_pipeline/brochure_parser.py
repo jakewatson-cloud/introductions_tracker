@@ -332,50 +332,45 @@ If no comparables found, return: {{"comparables": []}}
 {text}
 """
 
-OCCUPATIONAL_COMPS_PROMPT = """You are a commercial property analyst. Extract all **occupational / letting comparable evidence** and **tenancy schedule details** from the brochure text below.
+OCCUPATIONAL_COMPS_PROMPT = """You are a commercial property data extraction tool. Extract ALL occupational / letting data from the brochure text below.
 
-Occupational comparables are lease transactions or current tenancy details. They include:
-- Tenant names and unit details
-- Rent levels, lease terms, break dates
-- Found in "Tenancy Schedule", "Occupational Comparables", "Letting Evidence", "Income Schedule" sections
+There are TWO types of occupational data to look for. You must extract BOTH:
 
-For each occupational comparable or tenancy, extract:
-- **tenant_name**: Tenant / occupier name
+**TYPE 1 — TENANCY SCHEDULE**: The subject property's own current leases.
+Found in sections labelled "Tenancy Schedule", "Income Schedule", "Current Tenancies", or similar.
+These have tenant names, unit numbers, lease dates, passing rent, ERV, etc.
+
+**TYPE 2 — OCCUPATIONAL / RENTAL COMPARABLES**: Recent lettings at OTHER properties, used as benchmarking evidence.
+Found in sections labelled "Occupational Comparables", "Occupational Rental Comparables", "Letting Evidence", "Rental Evidence", "Letting Comparables", or similar.
+These typically have just a date, address, size, and rent (no tenant name or lease dates).
+They may appear as a small table next to or below the tenancy schedule.
+
+IMPORTANT: A brochure may contain MULTIPLE tenancy schedules and MULTIPLE comparable tables (e.g. one per estate in a portfolio). Extract ALL of them.
+
+EXCLUDE the following — these are NOT individual tenancies or comparables:
+- **Portfolio / estate summary rows**: Aggregate lines that summarise an entire estate or portfolio (e.g. "Multiple tenants", "Various (15 units)", total WAULT, overall reversion %, overall vacancy %). These describe the whole property, not a single letting.
+- **Totals / subtotals rows**: Lines labelled "Total", "Sub-total", "Aggregate", or similar.
+- **The subject property's headline metrics** from the executive summary (e.g. total rent, total area, blended yield). These are deal-level figures, not individual tenancies.
+
+For each INDIVIDUAL entry (whether tenancy or comparable), extract:
+- **tenant_name**: Tenant / occupier name (null for rental comparables)
 - **unit_name**: Unit identifier or name (null if not stated)
 - **address**: Property address
 - **town**: Town/city
 - **postcode**: Postcode (null if not stated)
 - **size_sqft**: Unit size in sq ft (convert from sq m if needed)
-- **rent_pa**: Annual rent in £
-- **rent_psf**: Rent per sq ft (derive if possible)
-- **lease_start**: Lease start date (DD/MM/YYYY)
-- **lease_expiry**: Lease expiry date (DD/MM/YYYY)
+- **rent_pa**: Annual rent in £ (null if only rent PSF given)
+- **rent_psf**: Rent per sq ft
+- **lease_start**: Lease start date (DD/MM/YYYY) (null for rental comparables)
+- **lease_expiry**: Lease expiry date (DD/MM/YYYY) (null for rental comparables)
 - **break_date**: Break date (DD/MM/YYYY or null)
 - **rent_review_date**: Next rent review date (DD/MM/YYYY or null)
-- **lease_term_years**: Total lease term in years
+- **lease_term_years**: Total lease term in years (null for rental comparables)
 - **notes**: Any other relevant notes
+- **entry_type**: "tenancy" for Type 1 entries, "comparable" for Type 2 entries
+- **comp_date**: For rental comparables, the transaction date (e.g. "Q4 2025" or "01/2025"). null for tenancy entries.
 
-Return ONLY valid JSON array. Use null for unknown values:
-[
-    {{
-        "tenant_name": "Amazon",
-        "unit_name": "Unit 1",
-        "address": "Matrix Park, Chorley",
-        "town": "Chorley",
-        "postcode": "PR7 7NA",
-        "size_sqft": 25000,
-        "rent_pa": 175000,
-        "rent_psf": 7.0,
-        "lease_start": "01/06/2020",
-        "lease_expiry": "31/05/2030",
-        "break_date": null,
-        "rent_review_date": "01/06/2025",
-        "lease_term_years": 10,
-        "notes": "FRI lease"
-    }}
-]
-
-If no occupational comparables or tenancy details are found, return an empty array: []
+Return ONLY a valid JSON array. Use null for unknown values. If no data found, return: []
 
 ## Brochure text:
 
@@ -513,27 +508,45 @@ Return ONLY a valid JSON object with this structure:
 
 If no comparables found, return: {"comparables": []}"""
 
-_OCCUPATIONAL_COMPS_VISION_PROMPT = """You are a commercial property analyst. The images above are pages from an investment brochure. Extract all **occupational / letting comparable evidence** and **tenancy schedule details**.
+_OCCUPATIONAL_COMPS_VISION_PROMPT = """You are a commercial property data extraction tool. The images above are pages from an investment brochure. Extract ALL occupational / letting data.
 
-Look for "Tenancy Schedule", "Occupational Comparables", "Letting Evidence", "Income Schedule" sections.
+There are TWO types of occupational data to look for. You must extract BOTH:
 
-For each occupational comparable or tenancy, extract:
-- **tenant_name**: Tenant / occupier name
+**TYPE 1 — TENANCY SCHEDULE**: The subject property's own current leases.
+Found in sections labelled "Tenancy Schedule", "Income Schedule", "Current Tenancies", or similar.
+These have tenant names, unit numbers, lease dates, passing rent, ERV, etc.
+
+**TYPE 2 — OCCUPATIONAL / RENTAL COMPARABLES**: Recent lettings at OTHER properties, used as benchmarking evidence.
+Found in sections labelled "Occupational Comparables", "Occupational Rental Comparables", "Letting Evidence", "Rental Evidence", "Letting Comparables", or similar.
+These typically have just a date, address, size, and rent (no tenant name or lease dates).
+They may appear as a small table next to or below the tenancy schedule.
+
+IMPORTANT: A brochure may contain MULTIPLE tenancy schedules and MULTIPLE comparable tables (e.g. one per estate in a portfolio). Extract ALL of them.
+
+EXCLUDE the following — these are NOT individual tenancies or comparables:
+- **Portfolio / estate summary rows**: Aggregate lines that summarise an entire estate or portfolio (e.g. "Multiple tenants", "Various (15 units)", total WAULT, overall reversion %, overall vacancy %). These describe the whole property, not a single letting.
+- **Totals / subtotals rows**: Lines labelled "Total", "Sub-total", "Aggregate", or similar.
+- **The subject property's headline metrics** from the executive summary (e.g. total rent, total area, blended yield). These are deal-level figures, not individual tenancies.
+
+For each INDIVIDUAL entry (whether tenancy or comparable), extract:
+- **tenant_name**: Tenant / occupier name (null for rental comparables)
 - **unit_name**: Unit identifier or name (null if not stated)
 - **address**: Property address
 - **town**: Town/city
 - **postcode**: Postcode (null if not stated)
 - **size_sqft**: Unit size in sq ft (convert from sq m if needed)
-- **rent_pa**: Annual rent in £
-- **rent_psf**: Rent per sq ft (derive if possible)
-- **lease_start**: Lease start date (DD/MM/YYYY)
-- **lease_expiry**: Lease expiry date (DD/MM/YYYY)
+- **rent_pa**: Annual rent in £ (null if only rent PSF given)
+- **rent_psf**: Rent per sq ft
+- **lease_start**: Lease start date (DD/MM/YYYY) (null for rental comparables)
+- **lease_expiry**: Lease expiry date (DD/MM/YYYY) (null for rental comparables)
 - **break_date**: Break date (DD/MM/YYYY or null)
 - **rent_review_date**: Next rent review date (DD/MM/YYYY or null)
-- **lease_term_years**: Total lease term in years
+- **lease_term_years**: Total lease term in years (null for rental comparables)
 - **notes**: Any other relevant notes
+- **entry_type**: "tenancy" for Type 1 entries, "comparable" for Type 2 entries
+- **comp_date**: For rental comparables, the transaction date (e.g. "Q4 2025" or "01/2025"). null for tenancy entries.
 
-Return ONLY valid JSON array. Use null for unknown values. If no occupational comparables or tenancy details are found, return an empty array: []"""
+Return ONLY valid JSON array. Use null for unknown values. If no data found, return: []"""
 
 # ---------------------------------------------------------------------------
 # Judge / verification prompts
@@ -674,9 +687,14 @@ def parse_brochure(
 
     if not use_vision:
         logger.info("  Extracted %d characters of text", len(text))
-        # Truncate to fit within token limits
-        max_chars = 15000
+        # Truncate very large documents to stay within token limits.
+        # Sonnet's context is 200K tokens (~800K chars). 60K chars ≈ 15K
+        # tokens, which leaves ample room for prompts + response.
+        # The old limit of 15K was silently dropping tenancy schedules
+        # and comparable tables from longer portfolio brochures.
+        max_chars = 60000
         if len(text) > max_chars:
+            logger.warning("  Text is %d chars — truncating to %d", len(text), max_chars)
             text = text[:max_chars] + "\n\n[... truncated ...]"
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -853,12 +871,17 @@ def _extract_occupational_comps(
     source_deal: str,
     model: str,
 ) -> list[OccupationalComp]:
-    """Extract occupational comparables from brochure text using Claude API."""
+    """Extract occupational comparables from brochure text using Claude API.
+
+    Extracts both tenancy schedule entries (the subject property's own leases)
+    and occupational rental comparables (external lettings used as evidence).
+    """
     prompt = OCCUPATIONAL_COMPS_PROMPT.format(text=text)
 
     message = client.messages.create(
         model=model,
-        max_tokens=4000,
+        max_tokens=6000,
+        temperature=0,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -870,10 +893,15 @@ def _extract_occupational_comps(
 
     comps = []
     for item in data:
+        entry_type = item.get("entry_type", "tenancy")
+        if entry_type not in ("tenancy", "comparable"):
+            entry_type = "tenancy"  # Default to tenancy if unrecognised
+
         comps.append(
             OccupationalComp(
                 source_deal=source_deal,
-                tenant_name=item.get("tenant_name", ""),
+                tenant_name=item.get("tenant_name") or "",
+                entry_type=entry_type,
                 unit_name=item.get("unit_name"),
                 address=item.get("address", ""),
                 town=item.get("town", ""),
@@ -886,6 +914,7 @@ def _extract_occupational_comps(
                 break_date=item.get("break_date"),
                 rent_review_date=item.get("rent_review_date"),
                 lease_term_years=_to_float(item.get("lease_term_years")),
+                comp_date=item.get("comp_date"),
                 notes=item.get("notes"),
             )
         )
@@ -1212,12 +1241,16 @@ def _extract_occupational_comps_vision(
     source_deal: str,
     model: str,
 ) -> list[OccupationalComp]:
-    """Extract occupational comparables from brochure page images using vision API."""
+    """Extract occupational comparables from brochure page images using vision API.
+
+    Extracts both tenancy schedule entries and occupational rental comparables.
+    """
     content = _build_vision_content(page_images, _OCCUPATIONAL_COMPS_VISION_PROMPT)
 
     message = client.messages.create(
         model=model,
-        max_tokens=4000,
+        max_tokens=6000,
+        temperature=0,
         messages=[{"role": "user", "content": content}],
     )
 
@@ -1229,10 +1262,15 @@ def _extract_occupational_comps_vision(
 
     comps = []
     for item in data:
+        entry_type = item.get("entry_type", "tenancy")
+        if entry_type not in ("tenancy", "comparable"):
+            entry_type = "tenancy"
+
         comps.append(
             OccupationalComp(
                 source_deal=source_deal,
-                tenant_name=item.get("tenant_name", ""),
+                tenant_name=item.get("tenant_name") or "",
+                entry_type=entry_type,
                 unit_name=item.get("unit_name"),
                 address=item.get("address", ""),
                 town=item.get("town", ""),
@@ -1245,6 +1283,7 @@ def _extract_occupational_comps_vision(
                 break_date=item.get("break_date"),
                 rent_review_date=item.get("rent_review_date"),
                 lease_term_years=_to_float(item.get("lease_term_years")),
+                comp_date=item.get("comp_date"),
                 notes=item.get("notes"),
             )
         )
@@ -1257,7 +1296,7 @@ def _extract_occupational_comps_vision(
 # ---------------------------------------------------------------------------
 
 def _derive_quarter(date_str: Optional[str]) -> Optional[str]:
-    """Derive a quarter string (e.g. 'Q1 2025') from a date string.
+    """Derive a quarter string (e.g. '2025 Q1') from a date string.
 
     Handles formats: DD/MM/YYYY, MM/YYYY, YYYY, or None.
     """
@@ -1294,7 +1333,7 @@ def _derive_quarter(date_str: Optional[str]) -> Optional[str]:
         return None  # Can't determine quarter without month
 
     quarter = (month - 1) // 3 + 1
-    return f"Q{quarter} {year}"
+    return f"{year} Q{quarter}"
 
 
 def _strip_code_block(text: str) -> str:
