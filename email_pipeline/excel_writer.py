@@ -51,6 +51,10 @@ _STOP_WORDS = {
     "centre", "center", "works", "unit", "units", "road", "street",
     "lane", "way", "drive", "close", "ltd", "limited", "plc",
     "son", "sons",
+    # Street type abbreviations
+    "rd", "st", "ave", "ct", "pl", "sq",
+    # Common geographic/directional
+    "north", "south", "east", "west",
 }
 
 
@@ -141,10 +145,15 @@ def is_deal_match(
             return True, f"word overlap ({', '.join(sorted(overlap))})"
 
     # --- Tier 5: Fuzzy name match within same town ---
+    # Compare only significant words (strip "Industrial Estate", "Business Park", etc.)
+    # to avoid false positives from shared property type suffixes
     if _is_town_match(town_a, town_b):
-        ratio = difflib.SequenceMatcher(None, norm_a, norm_b).ratio()
-        if ratio >= 0.65:
-            return True, f"fuzzy match ({ratio:.0%})"
+        sig_a = " ".join(sorted(words_a)) if words_a else norm_a
+        sig_b = " ".join(sorted(words_b)) if words_b else norm_b
+        if sig_a and sig_b:
+            ratio = difflib.SequenceMatcher(None, sig_a, sig_b).ratio()
+            if ratio >= 0.65:
+                return True, f"fuzzy match ({ratio:.0%})"
 
     return False, ""
 
@@ -268,7 +277,16 @@ class PipelineWriter:
 
         # Write data
         col = self.COLUMNS
-        ws.cell(row=next_row, column=col["date"], value=deal.date)
+        # Parse date string to a proper date so Excel treats it as a date, not text
+        date_value = deal.date
+        if isinstance(date_value, str) and date_value.strip():
+            try:
+                parts = date_value.strip().split("/")
+                if len(parts) == 3:
+                    date_value = datetime(int(parts[2]), int(parts[1]), int(parts[0])).date()
+            except (ValueError, IndexError):
+                pass  # keep as string if parsing fails
+        ws.cell(row=next_row, column=col["date"], value=date_value)
         ws.cell(row=next_row, column=col["agent"], value=deal.agent)
         ws.cell(row=next_row, column=col["asset_name"], value=deal.asset_name)
         ws.cell(row=next_row, column=col["country"], value=deal.country)
@@ -804,11 +822,24 @@ class OccupationalCompsWriter:
             ws = wb.active
             print(f"\n  Writing {len(comps)} occ comps to {self.excel_path.name}...")
 
+            dupes = 0
+            merged = 0
+
             for i, comp in enumerate(comps):
-                if self._is_duplicate(ws, comp):
+                dup_row = self._find_duplicate_row(ws, comp)
+                if dup_row is not None:
                     label = comp.tenant_name or comp.address
-                    print(f"    ⊘ Duplicate: {label} (source: {comp.source_deal})")
-                    logger.info("  Duplicate occ comp: %s — skipping", label)
+                    fills = self._merge_into_row(ws, dup_row, comp)
+                    if fills:
+                        merged += 1
+                        print(f"    ⊘ Duplicate occ comp: {label} "
+                              f"(source: {comp.source_deal}) "
+                              f"— merged {fills} field(s) into row {dup_row}")
+                    else:
+                        print(f"    ⊘ Duplicate: {label} (source: {comp.source_deal})")
+                    logger.info("  Duplicate occ comp: %s — skipping (row %d, merged %d)",
+                                label, dup_row, fills)
+                    dupes += 1
                     continue
 
                 next_row = self._find_next_row(ws)
@@ -816,8 +847,9 @@ class OccupationalCompsWriter:
                 written_comps.append(comp)
 
             print(f"  → {len(written_comps)} written, "
-                  f"{len(comps) - len(written_comps)} duplicates skipped")
-            return len(written_comps) > 0
+                  f"{dupes} duplicates skipped"
+                  f"{f' ({merged} with merge)' if merged else ''}")
+            return len(written_comps) > 0 or merged > 0
 
         _retry_write(self.excel_path, _write)
 
@@ -962,52 +994,195 @@ class OccupationalCompsWriter:
             ws.cell(row=row, column=self.COL_SOURCE_FILE, value=comp.source_file_path)
         ws.cell(row=row, column=self.COL_EXTRACTION_DATE, value=datetime.now().strftime("%d/%m/%Y"))
 
-    def _is_duplicate(self, ws, comp: OccupationalComp) -> bool:
-        """Check if a comp already exists.
+    # --- Dedup helpers (occupational comps) ---
 
-        For tenancy entries: match on source + tenant + address + unit + rent.
-        For rental comparables: match on source + address + comp_date (no tenant).
+    @staticmethod
+    def _normalise_tenant(name: str) -> str:
+        """Normalise a tenant name for comparison.
+
+        Lowercase, strip punctuation, collapse whitespace, and remove
+        common suffixes (Ltd, Limited, PLC, Inc) that vary between sources.
         """
-        comp_source = (comp.source_deal or "").strip().lower()
-        comp_tenant = (comp.tenant_name or "").strip().lower()
-        comp_addr = (comp.address or "").strip().lower()
-        comp_unit = (comp.unit_name or "").strip().lower()
+        n = _normalize_name(name)
+        # Strip common company suffixes
+        n = re.sub(r'\b(ltd|limited|plc|inc|llp|llc)\b', '', n)
+        return re.sub(r'\s+', ' ', n).strip()
+
+    @staticmethod
+    def _normalise_unit(name: str) -> str:
+        """Normalise a unit name for comparison.
+
+        Lowercase, strip punctuation, strip 'unit'/'plot' prefixes,
+        strip leading zeros.
+        """
+        n = _normalize_name(name)
+        n = re.sub(r'\b0+(\d)', r'\1', n)        # "01" → "1"
+        n = re.sub(r'\bunit\b\s*', '', n)         # strip "unit" prefix
+        n = re.sub(r'\bplot\b\s*', '', n)         # strip "plot" prefix
+        return n.strip()
+
+    @staticmethod
+    def _is_rent_close(rent_a: Optional[float], rent_b: Optional[float],
+                       tolerance: float = 0.005) -> bool:
+        """Check if two rents are within ±tolerance of each other.
+
+        Default 0.5% tolerance handles rounding (e.g. £178,875 vs £178,876).
+        Returns False if either rent is None or zero.
+        """
+        if not rent_a or not rent_b:
+            return False
+        avg = (rent_a + rent_b) / 2
+        if avg == 0:
+            return False
+        return abs(rent_a - rent_b) / avg <= tolerance
+
+    def _find_duplicate_row(self, ws, comp: OccupationalComp) -> Optional[int]:
+        """Find an existing row that matches this comp.
+
+        Three-phase dedup:
+
+        Phase 1 — Normalised tenant name + rent PA within ±0.5%
+                  (catches same tenant from different source brochures)
+
+        Phase 2 — Exact normalised unit + rent PA within ±0.5%
+                  (catches same unit from different source brochures
+                   where tenant name may differ slightly)
+
+        Phase 3 — Fuzzy tenant name (SequenceMatcher ≥ 0.90) + rent PA
+                  within ±0.5%  (catches near-misspellings like
+                  "Planetbloom" vs "Planet Bloom")
+
+        Rows where tenant is "Vacant" are skipped entirely — they
+        are not meaningful for dedup.
+
+        Returns the matching row number, or None if no match found.
+        """
+        comp_tenant = self._normalise_tenant(comp.tenant_name or "")
+        comp_unit = self._normalise_unit(comp.unit_name or "")
+
+        # Skip explicitly "vacant" entries — not useful for dedup.
+        # Empty tenant is fine (comparables have no tenant).
+        if comp_tenant in ("vacant", "vacant under offer"):
+            return None
+
         comp_rent = comp.rent_pa
+        comp_rent_psf = comp.rent_psf
 
         for row in range(2, ws.max_row + 1):
-            existing_source = str(ws.cell(row=row, column=self.COL_SOURCE).value or "").strip().lower()
-            existing_type = str(ws.cell(row=row, column=self.COL_ENTRY_TYPE).value or "").strip().lower()
-            existing_tenant = str(ws.cell(row=row, column=self.COL_TENANT).value or "").strip().lower()
-            existing_addr = str(ws.cell(row=row, column=self.COL_ADDRESS).value or "").strip().lower()
-            existing_unit = str(ws.cell(row=row, column=self.COL_UNIT).value or "").strip().lower()
-            existing_comp_date = str(ws.cell(row=row, column=self.COL_COMP_DATE).value or "").strip().lower()
+            existing_source = ws.cell(row=row, column=self.COL_SOURCE).value
+            if not existing_source:
+                continue
+
+            existing_tenant_raw = str(ws.cell(row=row, column=self.COL_TENANT).value or "").strip()
+            existing_tenant = self._normalise_tenant(existing_tenant_raw)
+
+            # Skip explicitly vacant rows in the sheet too
+            if existing_tenant in ("vacant", "vacant under offer"):
+                continue
+
             existing_rent = ws.cell(row=row, column=self.COL_RENT_PA).value
+            try:
+                existing_rent = float(existing_rent) if existing_rent else None
+            except (TypeError, ValueError):
+                existing_rent = None
 
-            if not existing_addr and not existing_tenant:
-                continue
+            existing_rent_psf = ws.cell(row=row, column=self.COL_RENT_PSF).value
+            try:
+                existing_rent_psf = float(existing_rent_psf) if existing_rent_psf else None
+            except (TypeError, ValueError):
+                existing_rent_psf = None
 
-            if existing_source != comp_source:
-                continue
-
-            if comp.entry_type == "comparable":
-                # Rental comparables: match on source + address + comp_date
-                if (
-                    existing_type == "comparable"
-                    and existing_addr == comp_addr
-                    and existing_comp_date == (comp.comp_date or "").strip().lower()
-                ):
+            # Helper: rent PA match, falling back to PSF when both PA are None
+            def _rents_match() -> bool:
+                if self._is_rent_close(comp_rent, existing_rent):
                     return True
-            else:
-                # Tenancy entries: match on source + tenant + address + unit + rent
-                if (
-                    existing_tenant == comp_tenant
-                    and existing_addr == comp_addr
-                    and existing_unit == comp_unit
-                    and existing_rent == comp_rent
-                ):
-                    return True
+                if comp_rent is None and existing_rent is None:
+                    return self._is_rent_close(comp_rent_psf, existing_rent_psf)
+                return False
 
-        return False
+            # Phase 1: tenant name + rent
+            if comp_tenant and existing_tenant == comp_tenant:
+                if _rents_match():
+                    return row
+
+            # Phase 2: unit + rent (exact)
+            if comp_unit:
+                existing_unit = self._normalise_unit(
+                    str(ws.cell(row=row, column=self.COL_UNIT).value or "").strip()
+                )
+                if existing_unit and comp_unit == existing_unit:
+                    if _rents_match():
+                        return row
+
+            # Phase 3: fuzzy tenant name + rent
+            if (comp_tenant and existing_tenant
+                    and _rents_match()):
+                ratio = difflib.SequenceMatcher(
+                    None, comp_tenant, existing_tenant
+                ).ratio()
+                if ratio >= 0.90:
+                    logger.info(
+                        "  Fuzzy tenant match (%.0f%%): '%s' ~ '%s' (row %d)",
+                        ratio * 100, comp_tenant, existing_tenant, row,
+                    )
+                    return row
+
+        return None
+
+    def _merge_into_row(self, ws, row: int, comp: OccupationalComp) -> int:
+        """Merge data from a duplicate comp into an existing row.
+
+        For each column: if the existing cell is empty but the comp has a
+        value, copy the comp's value in.  Never overwrites existing data.
+
+        Returns the number of cells filled.
+        """
+        fills = 0
+
+        # Map: column index → comp value (matching _write_comp logic)
+        field_map = {
+            self.COL_TENANT: comp.tenant_name,
+            self.COL_UNIT: comp.unit_name,
+            self.COL_ADDRESS: comp.address,
+            self.COL_TOWN: comp.town,
+            self.COL_POSTCODE: comp.postcode,
+            self.COL_SIZE: comp.size_sqft,
+            self.COL_RENT_PA: comp.rent_pa,
+            self.COL_RENT_PSF: comp.rent_psf,
+            self.COL_LEASE_START: comp.lease_start,
+            self.COL_LEASE_EXPIRY: comp.lease_expiry,
+            self.COL_BREAK: comp.break_date,
+            self.COL_REVIEW: comp.rent_review_date,
+            self.COL_TERM: comp.lease_term_years,
+            self.COL_COMP_DATE: comp.comp_date,
+            self.COL_NOTES: comp.notes,
+        }
+
+        col_names = {
+            self.COL_TENANT: "Tenant", self.COL_UNIT: "Unit",
+            self.COL_ADDRESS: "Address", self.COL_TOWN: "Town",
+            self.COL_POSTCODE: "Postcode", self.COL_SIZE: "Size",
+            self.COL_RENT_PA: "Rent PA", self.COL_RENT_PSF: "Rent PSF",
+            self.COL_LEASE_START: "Lease Start", self.COL_LEASE_EXPIRY: "Lease Expiry",
+            self.COL_BREAK: "Break", self.COL_REVIEW: "Review",
+            self.COL_TERM: "Term", self.COL_COMP_DATE: "Comp Date",
+            self.COL_NOTES: "Notes",
+        }
+
+        for col_idx, new_val in field_map.items():
+            if new_val is None:
+                continue
+            if isinstance(new_val, str) and not new_val.strip():
+                continue
+            existing = ws.cell(row=row, column=col_idx).value
+            if existing is not None and str(existing).strip() != "":
+                continue  # already has data — don't overwrite
+            ws.cell(row=row, column=col_idx, value=new_val)
+            fills += 1
+            logger.debug("  Row %d, %s: ← %s", row,
+                         col_names.get(col_idx, f"Col {col_idx}"), new_val)
+
+        return fills
 
     def _find_next_row(self, ws) -> int:
         """Find the next empty row (scanning column A = source deal, always populated)."""
@@ -1047,10 +1222,34 @@ def _backup_file(file_path: Path) -> Optional[Path]:
     try:
         shutil.copy2(str(file_path), str(backup_path))
         logger.info("  Backup created: %s", backup_path.name)
-        return backup_path
     except Exception as e:
         logger.warning("  Failed to create backup: %s", e)
         return None
+
+    # Prune old backups — keep only the 5 most recent per source file
+    _prune_backups(backup_dir, file_path.stem, keep=5)
+
+    return backup_path
+
+
+def _prune_backups(backup_dir: Path, stem: str, keep: int = 5):
+    """Delete old backups, keeping only the *keep* most recent per source file.
+
+    Backups are matched by filename prefix (the original file's stem) and
+    sorted by modification time.  Only ``.xlsx`` files are considered.
+    """
+    try:
+        pattern = f"{stem}_*.xlsx"
+        backups = sorted(
+            backup_dir.glob(pattern),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for old in backups[keep:]:
+            old.unlink()
+            logger.info("  Pruned old backup: %s", old.name)
+    except Exception as e:
+        logger.warning("  Failed to prune backups: %s", e)
 
 
 def _retry_write(file_path: Path, write_fn, max_retries: int = MAX_RETRIES) -> bool:

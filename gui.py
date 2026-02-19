@@ -27,6 +27,23 @@ from email_pipeline.database import Database
 from email_pipeline.gmail_auth import get_gmail_service
 
 
+def _parse_date_display(date_str: str) -> str:
+    """Convert a date string (ISO *or* DD/MM/YYYY) to DD/MM/YYYY for display."""
+    s = date_str.strip()
+    # Already DD/MM/YYYY?
+    try:
+        return datetime.strptime(s, "%d/%m/%Y").strftime("%d/%m/%Y")
+    except ValueError:
+        pass
+    # ISO format (e.g. 2026-02-18T15:03:43)
+    try:
+        return datetime.fromisoformat(s).strftime("%d/%m/%Y")
+    except ValueError:
+        pass
+    # Fallback: return first 10 chars
+    return s[:10]
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Threading helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -43,6 +60,31 @@ class StdoutRedirector:
 
     def flush(self):
         pass
+
+
+def check_files_writable(paths: list[Path]) -> list[Path]:
+    """Check that all files can be opened for writing (not locked by Excel).
+
+    Parameters
+    ----------
+    paths : list[Path]
+        Files to check.  Non-existent files are skipped (they'll be created).
+
+    Returns
+    -------
+    list[Path]
+        Paths that are locked / not writable.  Empty list means all OK.
+    """
+    locked = []
+    for p in paths:
+        if p is None or not p.exists():
+            continue
+        try:
+            with open(p, "r+b"):
+                pass
+        except (PermissionError, OSError):
+            locked.append(p)
+    return locked
 
 
 def run_in_thread(target, result_queue: queue.Queue, log_queue: queue.Queue | None = None):
@@ -142,12 +184,12 @@ class FilterFrame(ttk.LabelFrame):
 
         row = 0
 
-        # Date range
-        ttk.Label(self, text="After (YYYY-MM-DD):").grid(row=row, column=0, sticky="w")
+        # Date range (inclusive — DD/MM/YYYY)
+        ttk.Label(self, text="From (DD/MM/YYYY):").grid(row=row, column=0, sticky="w")
         self.after_var = tk.StringVar()
         ttk.Entry(self, textvariable=self.after_var, width=14).grid(row=row, column=1, sticky="w", padx=(4, 16))
 
-        ttk.Label(self, text="Before (YYYY-MM-DD):").grid(row=row, column=2, sticky="w")
+        ttk.Label(self, text="To (DD/MM/YYYY):").grid(row=row, column=2, sticky="w")
         self.before_var = tk.StringVar()
         ttk.Entry(self, textvariable=self.before_var, width=14).grid(row=row, column=3, sticky="w")
         row += 1
@@ -190,12 +232,30 @@ class FilterFrame(ttk.LabelFrame):
     # Convenience getters -------------------------------------------------
 
     def get_after(self) -> str | None:
+        """Convert inclusive 'From' DD/MM/YYYY to Gmail-compatible YYYY-MM-DD.
+
+        Gmail's ``after:`` is exclusive, so we subtract one day to make
+        the user-facing 'From' date inclusive.
+        """
         v = self.after_var.get().strip()
-        return v if v else None
+        if not v:
+            return None
+        dt = datetime.strptime(v, "%d/%m/%Y")
+        inclusive = dt - timedelta(days=1)
+        return inclusive.strftime("%Y-%m-%d")
 
     def get_before(self) -> str | None:
+        """Convert inclusive 'To' DD/MM/YYYY to Gmail-compatible YYYY-MM-DD.
+
+        Gmail's ``before:`` is exclusive, so we add one day to make
+        the user-facing 'To' date inclusive.
+        """
         v = self.before_var.get().strip()
-        return v if v else None
+        if not v:
+            return None
+        dt = datetime.strptime(v, "%d/%m/%Y")
+        inclusive = dt + timedelta(days=1)
+        return inclusive.strftime("%Y-%m-%d")
 
     def get_label(self) -> str | None:
         v = self.label_var.get().strip()
@@ -218,19 +278,19 @@ class FilterFrame(ttk.LabelFrame):
 
     def validate(self) -> str | None:
         """Return an error message, or None if valid."""
-        for name, var in [("After", self.after_var), ("Before", self.before_var)]:
+        for name, var in [("From", self.after_var), ("To", self.before_var)]:
             v = var.get().strip()
             if v:
                 try:
-                    datetime.strptime(v, "%Y-%m-%d")
+                    datetime.strptime(v, "%d/%m/%Y")
                 except ValueError:
-                    return f"{name} date must be YYYY-MM-DD (got '{v}')"
+                    return f"{name} date must be DD/MM/YYYY (got '{v}')"
         return None
 
     def set_last_n_days(self, n: int):
-        """Pre-fill date range for the last *n* days."""
-        self.before_var.set("")
-        self.after_var.set((datetime.now() - timedelta(days=n)).strftime("%Y-%m-%d"))
+        """Pre-fill date range for the last *n* days (inclusive)."""
+        self.after_var.set((datetime.now() - timedelta(days=n)).strftime("%d/%m/%Y"))
+        self.before_var.set(datetime.now().strftime("%d/%m/%Y"))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -471,8 +531,7 @@ class ScanTab(ttk.Frame):
 
         for t in threads:
             try:
-                dt = datetime.fromisoformat(t.latest_date)
-                date_str = dt.strftime("%d/%m/%Y")
+                date_str = _parse_date_display(t.latest_date)
             except ValueError:
                 date_str = t.latest_date[:12]
 
@@ -527,8 +586,8 @@ class ScanTab(ttk.Frame):
 
         # Date range
         try:
-            d1 = datetime.fromisoformat(t.earliest_date).strftime("%d/%m/%Y")
-            d2 = datetime.fromisoformat(t.latest_date).strftime("%d/%m/%Y")
+            d1 = _parse_date_display(t.earliest_date)
+            d2 = _parse_date_display(t.latest_date)
         except ValueError:
             d1 = t.earliest_date[:10]
             d2 = t.latest_date[:10]
@@ -615,6 +674,23 @@ class ProcessTab(ttk.Frame):
         api_key = cfg.get_anthropic_api_key()
         if not api_key:
             messagebox.showwarning("Missing API Key", "ANTHROPIC_API_KEY is not set.\nAdd it in the Settings tab.")
+            return
+
+        # Pre-flight: check all target files are writable
+        targets = [
+            cfg.get_pipeline_excel_path(),
+            cfg.get_investment_comps_path(),
+            cfg.get_occupational_comps_path(),
+            cfg.get_cleaned_occupational_comps_path(),
+        ]
+        locked = check_files_writable(targets)
+        if locked:
+            names = "\n".join(f"  • {p.name}" for p in locked)
+            messagebox.showerror(
+                "Files Locked",
+                f"The following file(s) are open — please close them "
+                f"in Excel and try again:\n\n{names}",
+            )
             return
 
         self.proc_btn.config(state="disabled")
@@ -819,6 +895,23 @@ class BrochureTab(ttk.Frame):
             return
 
         target = Path(fpath)
+
+        # Pre-flight: check target files are writable (if writing is enabled)
+        if self.write_excel_var.get():
+            targets = [
+                cfg.get_investment_comps_path(),
+                cfg.get_occupational_comps_path(),
+                cfg.get_cleaned_occupational_comps_path(),
+            ]
+            locked = check_files_writable(targets)
+            if locked:
+                names = "\n".join(f"  • {p.name}" for p in locked)
+                messagebox.showerror(
+                    "Files Locked",
+                    f"The following file(s) are open — please close them "
+                    f"in Excel and try again:\n\n{names}",
+                )
+                return
 
         if target.is_dir():
             self._run_folder_mode(target, api_key)
@@ -1064,10 +1157,19 @@ class BrochureTab(ttk.Frame):
                 _backup_file(occ_path)
 
                 try:
-                    from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
-                    snapshot_raw_csv(occ_path)
+                    from find_occ_dupes import dedup_occupational_comps
+                    dedup_summary = dedup_occupational_comps(occ_path, fix=True)
+                    removed = dedup_summary.get("rows_removed", 0)
+                    if removed > 0:
+                        print(f"  Dedup: removed {removed} rows "
+                              f"({dedup_summary.get('duplicate_pairs', 0)} dupes, "
+                              f"{dedup_summary.get('vacant_rows', 0)} vacant, "
+                              f"{dedup_summary.get('inv_comp_rows', 0)} inv comps, "
+                              f"{dedup_summary.get('no_rent_rows', 0)} no-rent)")
+                    else:
+                        print(f"  Dedup: no duplicates or invalid rows found")
                 except Exception as e:
-                    print(f"  ⚠ CSV snapshot failed: {e}")
+                    print(f"  ⚠ Occ comps dedup failed: {e}")
 
                 try:
                     from email_pipeline.occ_comps_cleaner import clean_occupational_comps
@@ -1214,8 +1316,8 @@ class BrochureTab(ttk.Frame):
                     from email_pipeline.excel_writer import _backup_file
                     _backup_file(occ_path)
                     try:
-                        from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
-                        snapshot_raw_csv(occ_path)
+                        from find_occ_dupes import dedup_occupational_comps
+                        dedup_occupational_comps(occ_path, fix=True)
                     except Exception:
                         pass
                     try:
@@ -1238,7 +1340,13 @@ class BrochureTab(ttk.Frame):
     # ── Clean occ comps ─────────────────────────────────────────────
 
     def _on_clean_comps(self):
-        """Run the occupational comps cleaning pipeline standalone."""
+        """Dedup then clean occupational comps in one step.
+
+        1. Dedup: remove duplicates, vacants, and investment comps from
+           the master OCCUPATIONAL COMPARABLES.xlsx (with backup).
+        2. Clean: enrich data (postcodes, towns, dates, rent arithmetic)
+           and write to OCCUPATIONAL COMPARABLES - CLEANED.xlsx.
+        """
         occ_path = cfg.get_occupational_comps_path()
         if not occ_path or not occ_path.exists():
             messagebox.showwarning(
@@ -1248,21 +1356,45 @@ class BrochureTab(ttk.Frame):
             )
             return
 
+        # Pre-flight: check target files are writable
+        targets = [occ_path, cfg.get_cleaned_occupational_comps_path()]
+        locked = check_files_writable(targets)
+        if locked:
+            names = "\n".join(f"  • {p.name}" for p in locked)
+            messagebox.showerror(
+                "Files Locked",
+                f"The following file(s) are open — please close them "
+                f"in Excel and try again:\n\n{names}",
+            )
+            return
+
         self.clean_btn.config(state="disabled")
-        self.status_var.set("Cleaning occ comps...")
+        self.status_var.set("Deduplicating occ comps...")
         self._clear_results()
 
+        from find_occ_dupes import dedup_occupational_comps
         from email_pipeline.occ_comps_cleaner import clean_occupational_comps
 
         cleaned_path = cfg.get_cleaned_occupational_comps_path()
         db_path = cfg.get_db_path()
 
         def worker():
-            return clean_occupational_comps(
+            # Step 1: dedup the master file
+            dedup_result = dedup_occupational_comps(occ_path, fix=True)
+
+            print()
+            print("=" * 50)
+            print("Now cleaning occ comps...")
+            print("=" * 50)
+
+            # Step 2: clean into the enriched copy
+            clean_result = clean_occupational_comps(
                 raw_excel_path=occ_path,
                 cleaned_excel_path=cleaned_path,
                 db_path=db_path,
             )
+
+            return {"dedup": dedup_result, "clean": clean_result}
 
         run_in_thread(worker, self._result_queue, log_queue=self._log_queue)
         self._poll_clean_result()
@@ -1273,22 +1405,47 @@ class BrochureTab(ttk.Frame):
             status, data = self._result_queue.get_nowait()
             self.clean_btn.config(state="normal")
             if status == "success":
-                summary = data
+                combined = data
+                dedup = combined["dedup"]
+                clean = combined["clean"]
+
+                # Dedup summary
+                self._append_result(
+                    f"\n{'=' * 40}\n"
+                    f"Dedup Summary\n"
+                    f"{'=' * 40}\n"
+                    f"  Rows scanned:     {dedup['rows_scanned']}\n"
+                    f"  Duplicate pairs:  {dedup['duplicate_pairs']}\n"
+                    f"  Vacant rows:      {dedup['vacant_rows']}\n"
+                    f"  Inv comp rows:    {dedup.get('inv_comp_rows', 0)}\n"
+                    f"  No-rent rows:     {dedup.get('no_rent_rows', 0)}\n"
+                    f"  Rows removed:     {dedup['rows_removed']}\n"
+                )
+                if dedup.get("details"):
+                    self._append_result(
+                        f"\nDedup details ({len(dedup['details'])} items):\n"
+                    )
+                    for detail in dedup["details"]:
+                        self._append_result(f"  {detail}\n")
+
+                # Clean summary
                 self._append_result(
                     f"\n{'=' * 40}\n"
                     f"Cleaning Summary\n"
                     f"{'=' * 40}\n"
-                    f"  Rows scanned:  {summary['rows_scanned']}\n"
-                    f"  Cells filled:  {summary['cells_filled']}\n"
-                    f"  DB rows:       {summary['db_rows']}\n"
+                    f"  Rows scanned:    {clean['rows_scanned']}\n"
+                    f"  Cells filled:    {clean['cells_filled']}\n"
+                    f"  No-size removed: {clean.get('no_size_removed', 0)}\n"
+                    f"  DB rows:         {clean['db_rows']}\n"
                 )
-                if summary["details"]:
+                if clean["details"]:
                     self._append_result(
-                        f"\nDetails ({len(summary['details'])} changes):\n"
+                        f"\nCleaning details ({len(clean['details'])} changes):\n"
                     )
-                    for detail in summary["details"]:
+                    for detail in clean["details"]:
                         self._append_result(f"  {detail}\n")
-                self.status_var.set("Cleaning complete")
+
+                self.status_var.set("Clean complete")
             else:
                 self.status_var.set("Error")
                 messagebox.showerror("Clean Error", str(data))

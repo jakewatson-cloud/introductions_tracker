@@ -337,11 +337,6 @@ def cmd_parse_brochure(args):
             if occ_path and occ_path.exists():
                 _backup_file(occ_path)
                 try:
-                    from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
-                    snapshot_raw_csv(occ_path)
-                except Exception:
-                    pass
-                try:
                     from email_pipeline.occ_comps_cleaner import clean_occupational_comps
                     cleaned_path = get_cleaned_occupational_comps_path()
                     db_path = get_db_path()

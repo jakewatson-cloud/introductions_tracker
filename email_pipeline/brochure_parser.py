@@ -16,6 +16,7 @@ Claude API for structured extraction.
 import base64
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -619,7 +620,7 @@ def parse_brochure(
     file_path: Path,
     api_key: str,
     source_deal: str = "",
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "claude-sonnet-4-6",
     judge_model: str = _DEFAULT_JUDGE_MODEL,
     extract_deal: bool = True,
     extract_investment_comps: bool = True,
@@ -1298,12 +1299,23 @@ def _extract_occupational_comps_vision(
 def _derive_quarter(date_str: Optional[str]) -> Optional[str]:
     """Derive a quarter string (e.g. '2025 Q1') from a date string.
 
-    Handles formats: DD/MM/YYYY, MM/YYYY, YYYY, or None.
+    Handles formats: DD/MM/YYYY, MM/YYYY, YYYY, Q1 2025, 2025 Q1, or None.
     """
     if not date_str or not isinstance(date_str, str):
         return None
 
     date_str = date_str.strip()
+
+    # Already a quarter string: "2025 Q1" (new format)
+    m = re.match(r"^(\d{4})\s*Q([1-4])$", date_str, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)} Q{m.group(2)}"
+
+    # Already a quarter string: "Q1 2025" (old format) → convert
+    m = re.match(r"^Q([1-4])\s*[-/]?\s*(\d{4})$", date_str, re.IGNORECASE)
+    if m:
+        return f"{m.group(2)} Q{m.group(1)}"
+
     month = None
     year = None
 

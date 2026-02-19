@@ -334,11 +334,6 @@ def main():
     if occ_written > 0 and occ_path and occ_path.exists():
         _backup_file(occ_path)
         try:
-            from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
-            snapshot_raw_csv(occ_path)
-        except Exception as e:
-            print(f"  ⚠ CSV snapshot failed: {e}")
-        try:
             from email_pipeline.occ_comps_cleaner import clean_occupational_comps
             from config import get_cleaned_occupational_comps_path, get_db_path
             cleaned_path = get_cleaned_occupational_comps_path()

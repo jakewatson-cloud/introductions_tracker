@@ -490,13 +490,7 @@ def process_emails(
     if occupational_comps_path and occupational_comps_path.exists() and report.occupational_comps_added > 0:
         _backup_file(occupational_comps_path)
 
-        # CSV snapshot + cleaning pass for occ comps (once per run)
-        try:
-            from email_pipeline.occ_comps_cleaner import snapshot_raw_csv
-            snapshot_raw_csv(occupational_comps_path)
-        except Exception as e:
-            logger.warning("  CSV snapshot failed: %s", e)
-
+        # Cleaning pass for occ comps (once per run)
         try:
             from email_pipeline.occ_comps_cleaner import clean_occupational_comps
             from config import get_cleaned_occupational_comps_path, get_db_path
@@ -525,6 +519,48 @@ def process_emails(
     print(f"\n[Step 6/6] Processing complete!")
 
     return report
+
+
+def _strip_quoted_text(body: str) -> str:
+    """Strip quoted / forwarded content from an email body.
+
+    Keeps only the *new* text that the sender wrote, removing the
+    quoted reply chain underneath.  Common separators:
+
+    - "From: ... Sent: ..."  (Outlook forwards / replies)
+    - "On <date>, <name> wrote:"  (Gmail-style quoting)
+    - Lines starting with ">"  (plain-text quoting)
+    - "-----Original Message-----"
+    - "________________________________" (Outlook separator)
+
+    Returns the original body unchanged if no separator is found.
+    """
+    # Try each separator pattern — take text BEFORE the first match
+    import re as _re
+
+    separators = [
+        # Outlook-style "From: ... Sent: ..."
+        _re.compile(
+            r"^From:\s+.+?\n\s*Sent:\s+", _re.MULTILINE | _re.IGNORECASE
+        ),
+        # Gmail "On <date>, <name> wrote:"
+        _re.compile(
+            r"^On\s+.{10,80}\s+wrote:\s*$", _re.MULTILINE | _re.IGNORECASE
+        ),
+        # "-----Original Message-----"
+        _re.compile(r"-{3,}\s*Original Message\s*-{3,}", _re.IGNORECASE),
+        # Long underscores (Outlook separator)
+        _re.compile(r"_{10,}"),
+    ]
+
+    for pattern in separators:
+        m = pattern.search(body)
+        if m:
+            before = body[:m.start()].rstrip()
+            if before:  # Only use if there's actual new content above
+                return before
+
+    return body
 
 
 def _select_best_email(emails: list[EmailSummary]) -> EmailSummary:
@@ -583,7 +619,10 @@ def _process_thread(
             primary_email = best_email
         else:
             # Multi-email thread: concatenate all bodies oldest-first
-            # so Claude sees every deal mentioned across the conversation
+            # so Claude sees every deal mentioned across the conversation.
+            # Later emails often quote the entire earlier chain, so we
+            # strip quoted/forwarded blocks from emails 2+ to avoid
+            # bloating the body with duplicated content.
             body_parts = []
             primary_email = thread.emails[0]  # earliest = original introduction
 
@@ -596,6 +635,9 @@ def _process_thread(
 
                 if i == 1:
                     headers = _parse_headers(payload.get("headers", []))
+                else:
+                    # Strip quoted/forwarded content — keep only the new text
+                    email_body = _strip_quoted_text(email_body)
 
                 label = "(oldest)" if i == 1 else "(newest)" if i == len(thread.emails) else ""
                 body_parts.append(

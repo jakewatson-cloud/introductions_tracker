@@ -364,7 +364,7 @@ def scan_emails(
             # Gmail dates can be complex, extract the core date
             internal_date = msg.get("internalDate", "0")
             dt = datetime.fromtimestamp(int(internal_date) / 1000)
-            iso_date = dt.isoformat()
+            iso_date = dt.strftime("%d/%m/%Y")
         except (ValueError, TypeError):
             iso_date = date_str
 
@@ -454,12 +454,13 @@ def print_scan_results(summaries: list[EmailSummary]) -> None:
     print(f"  {'─' * 3}  {'─' * 12} {'─' * 35} {'─' * 50} {'─' * 20} {'─' * 30}")
 
     for i, s in enumerate(summaries, 1):
-        # Format date
+        # Format date — already DD/MM/YYYY, but handle legacy ISO too
+        date_str = s.date
         try:
             dt = datetime.fromisoformat(s.date)
             date_str = dt.strftime("%d/%m/%Y")
         except ValueError:
-            date_str = s.date[:12]
+            date_str = s.date[:10]
 
         # Truncate fields
         sender_short = s.sender[:33] + ".." if len(s.sender) > 35 else s.sender

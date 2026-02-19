@@ -163,7 +163,7 @@ def classify_and_extract(
     subject: str,
     body: str,
     gmail_message_id: str = "",
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "claude-sonnet-4-6",
 ) -> tuple[ClassificationResult, list[DealExtraction]]:
     """Classify an email and extract deal data if it's an introduction.
 
@@ -189,7 +189,7 @@ def classify_and_extract(
     client = anthropic.Anthropic(api_key=api_key)
 
     # Truncate body to avoid excessive token usage
-    max_body_chars = 8000
+    max_body_chars = 12000
     if len(body) > max_body_chars:
         body = body[:max_body_chars] + "\n\n[... truncated ...]"
 
@@ -210,21 +210,9 @@ def classify_and_extract(
         # Parse response
         response_text = message.content[0].text.strip()
 
-        # Extract JSON from response (handle markdown code blocks)
-        if response_text.startswith("```"):
-            # Strip code block markers
-            lines = response_text.split("\n")
-            json_lines = []
-            in_block = False
-            for line in lines:
-                if line.strip().startswith("```"):
-                    in_block = not in_block
-                    continue
-                if in_block or not line.strip().startswith("```"):
-                    json_lines.append(line)
-            response_text = "\n".join(json_lines)
-
-        data = json.loads(response_text)
+        # Extract JSON from response — handles code blocks, leading/trailing text,
+        # and multiple JSON objects (only the first { ... } block is used).
+        data = _extract_json(response_text)
 
         is_intro = data.get("is_introduction", False)
         reason = data.get("reason", "")
@@ -303,7 +291,7 @@ def classify_and_extract(
 def batch_classify(
     api_key: str,
     emails: list[dict],
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "claude-sonnet-4-6",
 ) -> list[ClassificationResult]:
     """Classify a batch of emails as introductions or not.
 
@@ -408,6 +396,67 @@ _SUBJECT_SUFFIX_RE = re.compile(
     r"\s*-\s*(?:Subject to|Revised|Logistics Warehous|Investment Opport).*$",
     re.IGNORECASE,
 )
+
+
+def _extract_json(text: str) -> dict:
+    """Robustly extract a JSON object from Claude's response.
+
+    Handles:
+    - Clean JSON
+    - JSON wrapped in ```json ... ``` code blocks
+    - Leading/trailing commentary text outside the JSON
+    - Multiple JSON objects (only the first { ... } is used)
+    """
+    # 1. Strip code block markers
+    if "```" in text:
+        lines = text.split("\n")
+        json_lines = []
+        in_block = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_block = not in_block
+                continue
+            if in_block:
+                json_lines.append(line)
+        if json_lines:
+            text = "\n".join(json_lines)
+
+    # 2. Try parsing the whole thing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Find the first top-level { ... } block via brace matching
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    raise json.JSONDecodeError("No valid JSON object found in response", text, 0)
 
 
 def _extract_asset_name_from_subject(subject: str) -> str:

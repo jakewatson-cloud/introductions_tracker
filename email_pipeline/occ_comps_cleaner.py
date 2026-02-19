@@ -10,11 +10,17 @@ cascade order, and outputs:
 
 Rules (applied in cascade order):
     1. Date normalisation          — all date columns to ISO YYYY-MM-DD
+    1b. Address from source deal   — fill blank address/town from source deal column
     2. Postcode from address       — regex-extract UK postcode from address string
     3. Town from postcode          — postcodes.io bulk lookup
+    3b. Postcode from Sonnet       — Claude infers postcode from address/town
     4. Acres to sqft               — parse notes for site area in acres
     5. Rent arithmetic             — fill 3rd value from 2 known (size, PA, PSF)
-    6. Build total_address         — concatenate address + town + postcode
+    7. Comp date derivation        — fill comp_date from lease_start + term logic
+    8. Build total_address         — concatenate address + town + postcode
+
+Post-enrichment filters:
+    - Remove rows still missing unit size after all derivation rules
 
 Called automatically after OccupationalCompsWriter.append_comps() completes.
 Also callable standalone from the GUI "Clean Occ Comps" button.
@@ -109,6 +115,7 @@ RETRY_DELAY = 5
 
 # postcodes.io
 _POSTCODES_IO_URL = "https://api.postcodes.io/postcodes"
+_POSTCODES_IO_PLACES_URL = "https://api.postcodes.io/places"
 _POSTCODES_IO_BATCH_SIZE = 100
 
 
@@ -169,9 +176,12 @@ def clean_occupational_comps(
         town = (row.get("town") or "").strip()
         if pc and not town:
             postcodes_needing_town.add(_normalise_postcode(pc))
-        # Also check if address contains a postcode that could be extracted
+        # Also check if address (or source_deal fallback) contains a postcode
         if not pc:
             addr = (row.get("address") or "").strip()
+            # If address is empty, source_deal will be used as address by Rule 1b
+            if not addr:
+                addr = (row.get("source_deal") or "").strip()
             match = _UK_POSTCODE_RE.search(addr)
             if match:
                 extracted = _normalise_postcode(match.group())
@@ -184,16 +194,134 @@ def clean_occupational_comps(
         postcode_cache = _batch_postcode_lookup(list(postcodes_needing_town))
         print(f"  {len(postcode_cache)} postcodes resolved")
 
+    # Step 2b: Build places cache from source_deal comma segments.
+    # For rows missing location data, source_deal often contains the town
+    # (e.g. "Warrington, Gateway 49 Trade Park").  We extract unique candidate
+    # place names and validate them against postcodes.io /places endpoint.
+    candidate_places: set[str] = set()
+    for row in rows:
+        addr = (row.get("address") or "").strip()
+        town = (row.get("town") or "").strip()
+        pc = (row.get("postcode") or "").strip()
+        source_deal = (row.get("source_deal") or "").strip()
+
+        # Rows where source_deal could help fill gaps
+        if source_deal and "," in source_deal and (not addr or not town):
+            for part in source_deal.split(","):
+                clean = part.strip()
+                # Only consider parts that look like place names
+                if (len(clean) >= 3
+                        and clean[0].isalpha()
+                        and not _UK_POSTCODE_RE.search(clean)
+                        and not any(c.isdigit() for c in clean)):
+                    candidate_places.add(clean.lower())
+
+    places_cache: dict[str, dict] = {}
+    if candidate_places:
+        print(f"  Validating {len(candidate_places)} place name(s) via postcodes.io...")
+        places_cache = _batch_places_lookup(list(candidate_places))
+        print(f"  {len(places_cache)} confirmed as UK places")
+
     # Step 3: Clean each row
     print("  Applying cleaning rules...")
     changes = 0
     for i, row in enumerate(rows):
         row_num = i + 2  # Excel row (1-indexed, row 1 is headers)
-        row_changes = _clean_row(row, row_num, postcode_cache, summary["details"])
+        row_changes = _clean_row(row, row_num, postcode_cache, places_cache,
+                                 summary["details"])
         changes += row_changes
+
+    # Step 3b: Use Haiku to infer postcodes for rows still missing them.
+    # Collect unique (address, town) combos that need a postcode.
+    needs_postcode: dict[tuple[str, str], list[int]] = {}
+    for i, row in enumerate(rows):
+        pc = (row.get("postcode") or "").strip()
+        addr = (row.get("address") or "").strip()
+        town_val = (row.get("town") or "").strip()
+        if not pc and (addr or town_val):
+            key = (addr, town_val)
+            if key not in needs_postcode:
+                needs_postcode[key] = []
+            needs_postcode[key].append(i)
+
+    if needs_postcode:
+        print(f"  {len(needs_postcode)} unique locations still missing postcodes, "
+              f"asking Haiku...")
+        haiku_postcodes = _haiku_postcode_lookup(list(needs_postcode.keys()))
+        resolved = 0
+
+        # Validate Haiku results via postcodes.io and fill rows
+        haiku_pcs_to_validate = [
+            pc for pc in haiku_postcodes.values()
+            if pc and pc not in postcode_cache
+        ]
+        if haiku_pcs_to_validate:
+            extra_cache = _batch_postcode_lookup(list(set(haiku_pcs_to_validate)))
+            postcode_cache.update(extra_cache)
+
+        for (addr, town_val), row_indices in needs_postcode.items():
+            raw_pc = haiku_postcodes.get((addr, town_val))
+            if not raw_pc:
+                continue
+            norm_pc = _normalise_postcode(raw_pc)
+            # Only accept if postcodes.io confirms it's valid
+            if norm_pc not in postcode_cache:
+                logger.info("  Haiku suggested '%s' for '%s, %s' "
+                            "but postcodes.io didn't recognise it — skipping",
+                            norm_pc, addr, town_val)
+                continue
+
+            for idx in row_indices:
+                row = rows[idx]
+                row_num = idx + 2
+                row["postcode"] = norm_pc
+                changes += 1
+                resolved += 1
+                summary["details"].append(
+                    f"Row {row_num}: filled postcode '{norm_pc}' via Haiku "
+                    f"(from '{addr}, {town_val}')"
+                )
+                # Also fill town if still missing
+                if not (row.get("town") or "").strip():
+                    lookup = postcode_cache.get(norm_pc, {})
+                    if lookup.get("town"):
+                        row["town"] = lookup["town"]
+                        changes += 1
+                        summary["details"].append(
+                            f"Row {row_num}: filled town '{lookup['town']}' "
+                            f"from validated postcode {norm_pc}"
+                        )
+                # Rebuild total_address with new postcode
+                row["total_address"] = _rule_build_total_address(
+                    row.get("address") or "",
+                    row.get("town") or "",
+                    row.get("postcode") or "",
+                )
+
+        print(f"  {resolved} postcode(s) filled via Haiku "
+              f"({len(needs_postcode) - len(haiku_postcodes)} unresolved)")
+
+    # Step 3c: Write enriched location data back to the raw file so that
+    # Haiku / places lookups don't repeat on future runs.  We only write
+    # address, town, and postcode — columns that may have been blank
+    # and are now filled by rules 1b, 1c, 2, 3, and 3b.
+    _write_back_locations(rows, raw_excel_path)
 
     summary["cells_filled"] = changes
     print(f"  {changes} cells filled across {len(rows)} rows")
+
+    # Step 3d: Remove rows still missing unit size after all enrichment.
+    # Size can be derived from rent arithmetic (Rule 5) or acres (Rule 4),
+    # so we only remove rows that are still blank after those rules have run.
+    before_count = len(rows)
+    rows = [r for r in rows if r.get("size_sqft") is not None]
+    no_size_removed = before_count - len(rows)
+    if no_size_removed > 0:
+        print(f"  Removed {no_size_removed} row(s) with no unit size")
+        summary["details"].append(
+            f"Removed {no_size_removed} row(s) with no unit size (post-enrichment)"
+        )
+    summary["no_size_removed"] = no_size_removed
 
     # Step 4: Write cleaned Excel
     print(f"  Writing cleaned data to {cleaned_excel_path.name}...")
@@ -320,6 +448,7 @@ def _clean_row(
     row: dict,
     row_num: int,
     postcode_cache: dict[str, dict],
+    places_cache: dict[str, dict],
     details: list[str],
 ) -> int:
     """Apply all cleaning rules to a single row. Returns count of cells changed."""
@@ -338,6 +467,66 @@ def _clean_row(
                 )
         elif raw_val == "" or raw_val is None:
             row[col_name] = None
+
+    # --- Rule 1b: Fill address/town from source_deal when location fields are empty ---
+    address = (row.get("address") or "").strip()
+    town = (row.get("town") or "").strip()
+    postcode = (row.get("postcode") or "").strip()
+
+    if not address and not town and not postcode:
+        source_deal = (row.get("source_deal") or "").strip()
+        if source_deal:
+            # Try to split town from address using the places cache.
+            # Source deals are typically "Town, Property Name" or
+            # "Property Name, Town" — test each comma-separated part
+            # against the places cache to find the town.
+            parts = [p.strip() for p in source_deal.split(",")]
+            town_found = None
+            town_idx = None
+
+            if len(parts) >= 2 and places_cache:
+                for idx, part in enumerate(parts):
+                    clean = part.strip()
+                    if clean.lower() in places_cache:
+                        town_found = places_cache[clean.lower()]["name"]
+                        town_idx = idx
+                        break
+
+            if town_found is not None:
+                remaining = [p.strip() for i, p in enumerate(parts) if i != town_idx]
+                row["address"] = ", ".join(remaining)
+                row["town"] = town_found
+                address = row["address"]
+                town = town_found
+                changes += 2
+                details.append(
+                    f"Row {row_num}: filled address '{row['address']}' "
+                    f"and town '{town_found}' from source deal"
+                )
+            else:
+                # No place match — use the whole source_deal as address
+                row["address"] = source_deal
+                address = source_deal
+                changes += 1
+                details.append(
+                    f"Row {row_num}: filled address from source deal '{source_deal}'"
+                )
+
+    # --- Rule 1c: Fill town from source_deal when address exists but town is blank ---
+    if not town and not postcode:
+        source_deal = (row.get("source_deal") or "").strip()
+        parts = [p.strip() for p in source_deal.split(",")]
+        if len(parts) >= 2 and places_cache:
+            for part in parts:
+                clean = part.strip()
+                if clean.lower() in places_cache:
+                    row["town"] = places_cache[clean.lower()]["name"]
+                    town = row["town"]
+                    changes += 1
+                    details.append(
+                        f"Row {row_num}: filled town '{town}' from source deal"
+                    )
+                    break
 
     # --- Rule 2: Extract postcode from address ---
     postcode = (row.get("postcode") or "").strip()
@@ -419,7 +608,62 @@ def _clean_row(
             f"Row {row_num}: derived Size {size:,.0f} sqft from PA & PSF"
         )
 
-    # --- Rule 6: Build total_address ---
+    # --- Rule 7: Derive comp_date (source-of-truth date for the transaction) ---
+    # If comp_date is empty, derive it from lease_start and term:
+    #   - If term > 5 years AND review date is empty, use min(lease_start + 5y, today)
+    #     (captures rent reviewed at 5-year mark)
+    #   - Otherwise, use lease_start as-is
+    comp_date = row.get("comp_date")
+    lease_start = row.get("lease_start")
+
+    if not comp_date and lease_start:
+        lease_start_str = str(lease_start).strip()
+        try:
+            ls_dt = datetime.strptime(lease_start_str[:10], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            ls_dt = None
+
+        if ls_dt:
+            term_raw = row.get("lease_term_years")
+            review_raw = row.get("rent_review_date")
+            has_review = review_raw is not None and str(review_raw).strip() != ""
+
+            try:
+                term_years = float(term_raw) if term_raw else None
+            except (TypeError, ValueError):
+                term_years = None
+
+            if term_years and term_years > 5 and not has_review:
+                # Use lease start + 5 years, but only if that date is in the past
+                review_dt = ls_dt.replace(year=ls_dt.year + 5)
+                today = datetime.now()
+                if review_dt <= today:
+                    derived = review_dt.strftime("%Y-%m-%d")
+                    row["comp_date"] = derived
+                    changes += 1
+                    details.append(
+                        f"Row {row_num}: derived comp_date '{derived}' "
+                        f"(lease start + 5yr review)"
+                    )
+                else:
+                    # Review date would be in future — use lease start
+                    derived = ls_dt.strftime("%Y-%m-%d")
+                    row["comp_date"] = derived
+                    changes += 1
+                    details.append(
+                        f"Row {row_num}: derived comp_date '{derived}' "
+                        f"(lease start, 5yr review is future)"
+                    )
+            else:
+                # Term <= 5 or has review date — use lease start
+                derived = ls_dt.strftime("%Y-%m-%d")
+                row["comp_date"] = derived
+                changes += 1
+                details.append(
+                    f"Row {row_num}: derived comp_date '{derived}' from lease start"
+                )
+
+    # --- Rule 8: Build total_address ---
     row["total_address"] = _rule_build_total_address(
         row.get("address") or "",
         row.get("town") or "",
@@ -612,6 +856,141 @@ def _batch_postcode_lookup(postcodes: list[str]) -> dict[str, dict]:
     return cache
 
 
+def _batch_places_lookup(candidates: list[str]) -> dict[str, dict]:
+    """Validate place names via postcodes.io /places endpoint.
+
+    Takes a list of lowercase candidate place names and returns a dict
+    mapping confirmed place names to {name, county, region, outcode}.
+    Only returns entries where the API confirms a match.
+    """
+    cache: dict[str, dict] = {}
+
+    # Place types that indicate a settlement (not a building, park, etc.)
+    _SETTLEMENT_TYPES = {
+        "City", "Town", "Suburban Area", "Village", "Hamlet",
+        "Other Settlement", "Section of Named Road",
+    }
+
+    for candidate in candidates:
+        url = f"{_POSTCODES_IO_PLACES_URL}?q={urllib.request.quote(candidate)}&limit=1"
+        req = urllib.request.Request(url, method="GET")
+
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+
+                results = data.get("result") or []
+                if results:
+                    place = results[0]
+                    name = place.get("name_1", "")
+                    local_type = place.get("local_type", "")
+
+                    # Only accept settlement types — skip "Industrial Estate" etc.
+                    if local_type in _SETTLEMENT_TYPES:
+                        cache[candidate] = {
+                            "name": name,
+                            "county": place.get("county_unitary", ""),
+                            "region": place.get("region", ""),
+                            "outcode": place.get("outcode", ""),
+                        }
+                break  # Success (even if no result)
+
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < 2:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("postcodes.io places rate limited, waiting %ds", wait)
+                    time.sleep(wait)
+                else:
+                    logger.warning("postcodes.io places HTTP error: %s", e)
+                    break
+
+            except Exception as e:
+                logger.warning("postcodes.io places lookup failed: %s", e)
+                break
+
+    return cache
+
+
+def _haiku_postcode_lookup(
+    locations: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Use Claude Haiku to infer UK postcodes from address/town pairs.
+
+    Sends a single batched prompt with all locations and asks for the most
+    likely UK postcode for each.  Results are validated against postcodes.io
+    by the caller — this function just returns raw suggestions.
+
+    Parameters
+    ----------
+    locations : list of (address, town) tuples
+
+    Returns
+    -------
+    dict mapping (address, town) -> suggested postcode string
+    """
+    if not locations:
+        return {}
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.warning("ANTHROPIC_API_KEY not set — skipping Haiku postcode lookup")
+        return {}
+
+    # Build a numbered list for the prompt
+    location_lines = []
+    for i, (addr, town) in enumerate(locations, 1):
+        parts = [p for p in (addr, town) if p]
+        location_lines.append(f"{i}. {', '.join(parts)}")
+
+    prompt = (
+        "You are a UK commercial property expert. For each location below, "
+        "provide the most likely UK postcode. These are industrial estates, "
+        "business parks, and commercial properties.\n\n"
+        "Respond ONLY with a JSON object mapping the line number to the "
+        "postcode. If you are unsure, omit that entry. Use the format:\n"
+        '{"1": "WA5 3UL", "2": "B97 6RH"}\n\n'
+        "Locations:\n" + "\n".join(location_lines)
+    )
+
+    try:
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key)
+        message = client.messages.create(
+            model="claude-sonnet-4-5-20250929",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        response_text = message.content[0].text.strip()
+
+        # Strip markdown code block if present
+        if response_text.startswith("```"):
+            lines = response_text.split("\n")
+            response_text = "\n".join(
+                l for l in lines
+                if not l.startswith("```")
+            ).strip()
+
+        result_map = json.loads(response_text)
+
+        cache: dict[tuple[str, str], str] = {}
+        for key, pc in result_map.items():
+            idx = int(key) - 1
+            if 0 <= idx < len(locations):
+                normalised = _normalise_postcode(str(pc))
+                if _UK_POSTCODE_RE.match(normalised.replace(" ", "")):
+                    cache[locations[idx]] = normalised
+
+        logger.info("Haiku suggested %d/%d postcodes", len(cache), len(locations))
+        return cache
+
+    except Exception as e:
+        logger.warning("Haiku postcode lookup failed: %s", e)
+        print(f"  ⚠ Haiku postcode lookup failed: {e}")
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Numeric helper
 # ---------------------------------------------------------------------------
@@ -640,6 +1019,57 @@ def _to_number(value) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Output: Cleaned Excel
 # ---------------------------------------------------------------------------
+
+def _write_back_locations(rows: list[dict], raw_excel_path: Path):
+    """Write enriched address/town/postcode back to the raw Excel file.
+
+    Only touches cells that were blank in the original and are now filled
+    by the cleaning rules.  This means Haiku and places lookups won't
+    repeat on future runs.  Uses a temp file + copy for OneDrive safety.
+    """
+    raw_excel_path = Path(raw_excel_path)
+    if not raw_excel_path.exists():
+        return
+
+    try:
+        wb = load_workbook(str(raw_excel_path), data_only=False)
+        ws = wb.active
+
+        updates = 0
+        for i, row in enumerate(rows):
+            excel_row = i + 2  # 1-indexed, row 1 is headers
+
+            for col, key in (
+                (COL_ADDRESS, "address"),
+                (COL_TOWN, "town"),
+                (COL_POSTCODE, "postcode"),
+            ):
+                current = ws.cell(row=excel_row, column=col).value
+                new_val = (row.get(key) or "").strip()
+                if (current is None or str(current).strip() == "") and new_val:
+                    ws.cell(row=excel_row, column=col).value = new_val
+                    updates += 1
+
+        if updates > 0:
+            fd, tmp = tempfile.mkstemp(suffix=".xlsx")
+            os.close(fd)
+            try:
+                wb.save(tmp)
+                wb.close()
+                shutil.copy2(tmp, str(raw_excel_path))
+                print(f"  Wrote {updates} location cell(s) back to {raw_excel_path.name}")
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        else:
+            wb.close()
+
+    except Exception as e:
+        logger.warning("Failed to write locations back to raw file: %s", e)
+        print(f"  ⚠ Write-back to raw file failed: {e}")
+
 
 def _write_cleaned_excel(rows: list[dict], excel_path: Path):
     """Write cleaned rows to a new Excel file.
@@ -727,16 +1157,16 @@ def _write_cleaned_excel(rows: list[dict], excel_path: Path):
 # ---------------------------------------------------------------------------
 
 def _insert_into_db(rows: list[dict], db_path: Path) -> int:
-    """Upsert cleaned rows into the cleaned_occupational_comps table.
+    """Replace the cleaned_occupational_comps table with the current rows.
 
-    Uses INSERT OR REPLACE so existing rows (matched by the UNIQUE
-    constraint) are updated with the latest cleaned values, while new
-    rows are added.  No data is deleted.
+    Truncates the table first so the DB exactly mirrors the cleaned Excel
+    output — no stale rows from previous runs are kept.
     """
     cleaned_at = datetime.now().isoformat()
     count = 0
 
     with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("DELETE FROM cleaned_occupational_comps")
         for row in rows:
             try:
                 conn.execute(
