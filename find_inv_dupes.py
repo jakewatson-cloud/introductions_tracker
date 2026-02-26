@@ -1,6 +1,10 @@
 """
 Scan INVESTMENT COMPARABLES MASTER.xlsx for duplicate rows using the
-fuzzy matching logic (price ±5%, quarter ±1, fuzzy address).
+fuzzy matching logic (price ±5% if both present, quarter ±1, fuzzy address).
+
+Price rule: if both have a price → must be within ±5%. If one has a price
+and the other doesn't → no match. If neither has a price → match on
+address + quarter alone.
 
 Reports duplicate pairs, merges any extra data from the duplicate into
 the kept row, then deletes the duplicate row.
@@ -162,11 +166,15 @@ def main():
             if b["row"] in seen:
                 continue
 
-            # 1. Price (required on both)
-            if not a["price"] or not b["price"]:
+            # 1. Price check
+            if a["price"] and b["price"]:
+                # Both have prices — must be within ±5%
+                if not is_price_close(a["price"], b["price"]):
+                    continue
+            elif a["price"] or b["price"]:
+                # One has a price, the other doesn't — not a match
                 continue
-            if not is_price_close(a["price"], b["price"]):
-                continue
+            # else: neither has a price — skip price check
 
             # 2. Quarter (if both present, within ±1)
             if a["quarter_ord"] is not None and b["quarter_ord"] is not None:
@@ -208,7 +216,7 @@ def main():
                 merge_cols.append((col, dupe_val))
 
         if merge_cols:
-            print(f"  MERGE  {len(merge_cols)} field(s) from dupe → keep:")
+            print(f"  MERGE  {len(merge_cols)} field(s) from dupe -> keep:")
             for col, val in merge_cols:
                 display = f"{val}" if not isinstance(val, float) else f"{val:,.2f}"
                 print(f"           {COL_NAMES.get(col, f'Col {col}')}: {display}")

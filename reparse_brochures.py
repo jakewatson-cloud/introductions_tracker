@@ -29,7 +29,7 @@ from config import (
 )
 from email_pipeline.brochure_parser import parse_brochure
 from email_pipeline.database import Database
-from email_pipeline.excel_writer import InvestmentCompsWriter, OccupationalCompsWriter
+from email_pipeline.excel_writer import InvestmentCompsWriter
 
 logger = logging.getLogger(__name__)
 
@@ -321,24 +321,46 @@ def main():
         print(f"  Investment comps written: {inv_written} (of {len(all_inv_comps)} extracted)")
 
     if all_occ_comps and occ_path:
-        writer = OccupationalCompsWriter(occ_path)
-        occ_written = writer.append_comps(all_occ_comps)
-        print(f"  Occupational comps written: {occ_written} (of {len(all_occ_comps)} extracted)")
+        # DB write
+        from email_pipeline.occ_comps_db import RawOccCompsDB
+        raw_occ_db = RawOccCompsDB(get_db_path())
+        raw_occ_db.backup_db()
+        for comp in all_occ_comps:
+            raw_occ_db.insert_comp(comp)
+        occ_written = len(all_occ_comps)
+        print(f"  Occupational comps written to DB: {occ_written} (of {len(all_occ_comps)} extracted)")
 
-    # Post-write: backup, snapshot, clean (once per run)
+    # Post-write: backup inv comps, dedup + clean occ comps
     from email_pipeline.excel_writer import _backup_file
 
     if inv_written > 0 and inv_path and inv_path.exists():
         _backup_file(inv_path)
 
-    if occ_written > 0 and occ_path and occ_path.exists():
-        _backup_file(occ_path)
+    if occ_written > 0:
+        # DB dedup
+        try:
+            from email_pipeline.occ_comps_db import RawOccCompsDB as _RawDB
+            _raw_db = _RawDB(get_db_path())
+            dedup_summary = _raw_db.run_full_dedup(fix=True)
+            removed = dedup_summary.get("rows_removed", 0)
+            if removed > 0:
+                print(f"  DB Dedup: removed {removed} rows "
+                      f"({dedup_summary.get('duplicate_pairs', 0)} dupes, "
+                      f"{dedup_summary.get('vacant_rows', 0)} vacant, "
+                      f"{dedup_summary.get('inv_comp_rows', 0)} inv comps, "
+                      f"{dedup_summary.get('no_rent_rows', 0)} no-rent)")
+            else:
+                print(f"  DB Dedup: no duplicates or invalid rows found")
+        except Exception as e:
+            print(f"  ⚠ DB occ comps dedup failed: {e}")
+
+        # Clean + export Excel from DB
         try:
             from email_pipeline.occ_comps_cleaner import clean_occupational_comps
             from config import get_cleaned_occupational_comps_path, get_db_path
             cleaned_path = get_cleaned_occupational_comps_path()
             db_path = get_db_path()
-            if cleaned_path:
+            if cleaned_path and occ_path:
                 summary = clean_occupational_comps(
                     raw_excel_path=occ_path,
                     cleaned_excel_path=cleaned_path,

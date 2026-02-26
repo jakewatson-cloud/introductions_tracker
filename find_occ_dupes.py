@@ -33,37 +33,15 @@ from openpyxl import load_workbook
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from email_pipeline.excel_writer import _normalize_name
 
-
-# --- Column layout (1-based, matching OccupationalCompsWriter) ---
-COL_SOURCE = 1       # A: Source Deal
-COL_ENTRY_TYPE = 2   # B: Entry Type
-COL_TENANT = 3       # C: Tenant
-COL_UNIT = 4         # D: Unit
-COL_ADDRESS = 5      # E: Address
-COL_TOWN = 6         # F: Town
-COL_POSTCODE = 7     # G: Postcode
-COL_SIZE = 8         # H: Size (sqft)
-COL_RENT_PA = 9      # I: Rent PA
-COL_RENT_PSF = 10    # J: Rent PSF
-COL_LEASE_START = 11 # K
-COL_LEASE_EXPIRY = 12 # L
-COL_BREAK = 13       # M
-COL_REVIEW = 14      # N
-COL_TERM = 15        # O
-COL_COMP_DATE = 16   # P
-COL_NOTES = 17       # Q
-COL_SOURCE_FILE = 18 # R
-COL_EXTRACTION = 19  # S
-
-COL_RANGE = range(1, 20)  # A through S
-
-COL_NAMES = {
-    1: "Source Deal", 2: "Entry Type", 3: "Tenant", 4: "Unit",
-    5: "Address", 6: "Town", 7: "Postcode", 8: "Size",
-    9: "Rent PA", 10: "Rent PSF", 11: "Lease Start", 12: "Lease Expiry",
-    13: "Break", 14: "Review", 15: "Term", 16: "Comp Date",
-    17: "Notes", 18: "Source File", 19: "Extraction Date",
-}
+# --- Column layout — imported from central module ---
+from email_pipeline.occ_comps_columns import (
+    COL_SOURCE, COL_ENTRY_TYPE, COL_TENANT, COL_UNIT,
+    COL_ADDRESS, COL_TOWN, COL_POSTCODE, COL_SIZE,
+    COL_RENT_PA, COL_RENT_PSF, COL_LEASE_START, COL_LEASE_EXPIRY,
+    COL_BREAK, COL_REVIEW, COL_TERM, COL_COMP_DATE,
+    COL_NOTES, COL_SOURCE_FILE, COL_EXTRACTION,
+    COL_RANGE, COL_NAMES,
+)
 
 
 # --- Helpers ---

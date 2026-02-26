@@ -897,7 +897,7 @@ class BrochureTab(ttk.Frame):
         target = Path(fpath)
 
         # Pre-flight: check target files are writable (if writing is enabled)
-        if self.write_excel_var.get():
+        if self.write_var.get():
             targets = [
                 cfg.get_investment_comps_path(),
                 cfg.get_occupational_comps_path(),
@@ -1013,7 +1013,7 @@ class BrochureTab(ttk.Frame):
 
             from email_pipeline.brochure_parser import parse_brochure
             from email_pipeline.database import Database
-            from email_pipeline.excel_writer import InvestmentCompsWriter, OccupationalCompsWriter
+            from email_pipeline.excel_writer import InvestmentCompsWriter
 
             db = Database(str(cfg.get_db_path()))
 
@@ -1141,11 +1141,16 @@ class BrochureTab(ttk.Frame):
             if write_excel and all_occ:
                 occ_path = cfg.get_occupational_comps_path()
                 if occ_path:
-                    print(f"\n  Passing {len(all_occ)} occ comps to writer...")
-                    occ_written = OccupationalCompsWriter(occ_path).append_comps(all_occ)
-                    print(f"  Writer returned: {occ_written} written")
+                    print(f"\n  Writing {len(all_occ)} occ comps to DB...")
+                    from email_pipeline.occ_comps_db import RawOccCompsDB
+                    raw_occ_db = RawOccCompsDB(cfg.get_db_path())
+                    raw_occ_db.backup_db()
+                    for comp in all_occ:
+                        raw_occ_db.insert_comp(comp)
+                    occ_written = len(all_occ)
+                    print(f"  {occ_written} occ comps written to DB")
 
-            # --- Post-write: backup, snapshot, clean (once per run) ---
+            # --- Post-write: backup, dedup, clean (once per run) ---
             from email_pipeline.excel_writer import _backup_file
 
             if write_excel and inv_written > 0:
@@ -1153,31 +1158,33 @@ class BrochureTab(ttk.Frame):
                 if inv_path and inv_path.exists():
                     _backup_file(inv_path)
 
-            if write_excel and occ_written > 0 and occ_path and occ_path.exists():
-                _backup_file(occ_path)
-
+            if write_excel and occ_written > 0:
+                # DB dedup
                 try:
-                    from find_occ_dupes import dedup_occupational_comps
-                    dedup_summary = dedup_occupational_comps(occ_path, fix=True)
+                    from email_pipeline.occ_comps_db import RawOccCompsDB as _RawDB
+                    _raw_db = _RawDB(cfg.get_db_path())
+                    dedup_summary = _raw_db.run_full_dedup(fix=True)
                     removed = dedup_summary.get("rows_removed", 0)
                     if removed > 0:
-                        print(f"  Dedup: removed {removed} rows "
+                        print(f"  DB Dedup: removed {removed} rows "
                               f"({dedup_summary.get('duplicate_pairs', 0)} dupes, "
                               f"{dedup_summary.get('vacant_rows', 0)} vacant, "
                               f"{dedup_summary.get('inv_comp_rows', 0)} inv comps, "
                               f"{dedup_summary.get('no_rent_rows', 0)} no-rent)")
                     else:
-                        print(f"  Dedup: no duplicates or invalid rows found")
+                        print(f"  DB Dedup: no duplicates or invalid rows found")
                 except Exception as e:
-                    print(f"  ⚠ Occ comps dedup failed: {e}")
+                    print(f"  ⚠ DB occ comps dedup failed: {e}")
 
+                # Clean + export Excel from DB
                 try:
                     from email_pipeline.occ_comps_cleaner import clean_occupational_comps
                     from config import get_cleaned_occupational_comps_path, get_db_path
 
+                    occ_path = cfg.get_occupational_comps_path()
                     cleaned_path = get_cleaned_occupational_comps_path()
                     db_path = get_db_path()
-                    if cleaned_path:
+                    if cleaned_path and occ_path:
                         summary = clean_occupational_comps(
                             raw_excel_path=occ_path,
                             cleaned_excel_path=cleaned_path,
@@ -1287,7 +1294,7 @@ class BrochureTab(ttk.Frame):
         if not self.write_var.get():
             return
 
-        from email_pipeline.excel_writer import InvestmentCompsWriter, OccupationalCompsWriter
+        from email_pipeline.excel_writer import InvestmentCompsWriter
 
         # Stamp source provenance on investment comps (single-file mode)
         source_deal = self.deal_var.get() or Path(self.file_var.get()).stem
@@ -1310,29 +1317,31 @@ class BrochureTab(ttk.Frame):
         if result.occupational_comps:
             occ_path = cfg.get_occupational_comps_path()
             if occ_path:
-                count = OccupationalCompsWriter(occ_path).append_comps(result.occupational_comps)
-                written.append(f"{count} occupational comps -> {occ_path.name}")
-                if count > 0:
-                    from email_pipeline.excel_writer import _backup_file
-                    _backup_file(occ_path)
-                    try:
-                        from find_occ_dupes import dedup_occupational_comps
-                        dedup_occupational_comps(occ_path, fix=True)
-                    except Exception:
-                        pass
-                    try:
-                        from email_pipeline.occ_comps_cleaner import clean_occupational_comps
-                        from config import get_cleaned_occupational_comps_path, get_db_path
-                        cleaned_path = get_cleaned_occupational_comps_path()
-                        db_path = get_db_path()
-                        if cleaned_path:
-                            clean_occupational_comps(
-                                raw_excel_path=occ_path,
-                                cleaned_excel_path=cleaned_path,
-                                db_path=db_path,
-                            )
-                    except Exception:
-                        pass
+                # DB write
+                from email_pipeline.occ_comps_db import RawOccCompsDB
+                raw_occ_db = RawOccCompsDB(cfg.get_db_path())
+                raw_occ_db.backup_db()
+                for comp in result.occupational_comps:
+                    raw_occ_db.insert_comp(comp)
+                written.append(f"{len(result.occupational_comps)} occupational comps -> DB")
+                # Dedup + clean + export Excel from DB
+                try:
+                    raw_occ_db.run_full_dedup(fix=True)
+                except Exception:
+                    pass
+                try:
+                    from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+                    from config import get_cleaned_occupational_comps_path, get_db_path
+                    cleaned_path = get_cleaned_occupational_comps_path()
+                    db_path = get_db_path()
+                    if cleaned_path:
+                        clean_occupational_comps(
+                            raw_excel_path=occ_path,
+                            cleaned_excel_path=cleaned_path,
+                            db_path=db_path,
+                        )
+                except Exception:
+                    pass
 
         if written:
             self._append_result("\n\nExcel writes:\n  " + "\n  ".join(written))
@@ -1372,22 +1381,31 @@ class BrochureTab(ttk.Frame):
         self.status_var.set("Deduplicating occ comps...")
         self._clear_results()
 
-        from find_occ_dupes import dedup_occupational_comps
         from email_pipeline.occ_comps_cleaner import clean_occupational_comps
+        from email_pipeline.occ_comps_db import RawOccCompsDB
 
         cleaned_path = cfg.get_cleaned_occupational_comps_path()
         db_path = cfg.get_db_path()
 
         def worker():
-            # Step 1: dedup the master file
-            dedup_result = dedup_occupational_comps(occ_path, fix=True)
+            # Step 1: DB dedup
+            raw_db = RawOccCompsDB(db_path)
+            try:
+                dedup_result = raw_db.run_full_dedup(fix=True)
+            except Exception as e:
+                print(f"  ⚠ DB dedup failed: {e}")
+                dedup_result = {
+                    "rows_scanned": 0, "duplicate_pairs": 0,
+                    "vacant_rows": 0, "inv_comp_rows": 0,
+                    "no_rent_rows": 0, "rows_removed": 0, "details": [],
+                }
 
             print()
             print("=" * 50)
             print("Now cleaning occ comps...")
             print("=" * 50)
 
-            # Step 2: clean into the enriched copy
+            # Step 2: clean into the enriched copy + export Excel from DB
             clean_result = clean_occupational_comps(
                 raw_excel_path=occ_path,
                 cleaned_excel_path=cleaned_path,

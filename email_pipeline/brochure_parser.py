@@ -348,10 +348,11 @@ They may appear as a small table next to or below the tenancy schedule.
 
 IMPORTANT: A brochure may contain MULTIPLE tenancy schedules and MULTIPLE comparable tables (e.g. one per estate in a portfolio). Extract ALL of them.
 
-EXCLUDE the following — these are NOT individual tenancies or comparables:
+EXCLUDE the following — these are NOT individual tenancies or occupational comparables:
 - **Portfolio / estate summary rows**: Aggregate lines that summarise an entire estate or portfolio (e.g. "Multiple tenants", "Various (15 units)", total WAULT, overall reversion %, overall vacancy %). These describe the whole property, not a single letting.
 - **Totals / subtotals rows**: Lines labelled "Total", "Sub-total", "Aggregate", or similar.
 - **The subject property's headline metrics** from the executive summary (e.g. total rent, total area, blended yield). These are deal-level figures, not individual tenancies.
+- **INVESTMENT COMPARABLES**: Tables or rows showing property SALES with columns like Net Initial Yield (NIY), Capital Value (Cap Val), AWULTC, Sale Price, or Purchaser/Vendor. These are investment transactions, NOT occupational lettings. Even if they appear on the same page as letting data, do NOT extract them here. If a table has yield, price, or cap val columns it is an investment comparable, not an occupational one.
 
 For each INDIVIDUAL entry (whether tenancy or comparable), extract:
 - **tenant_name**: Tenant / occupier name (null for rental comparables)
@@ -524,10 +525,11 @@ They may appear as a small table next to or below the tenancy schedule.
 
 IMPORTANT: A brochure may contain MULTIPLE tenancy schedules and MULTIPLE comparable tables (e.g. one per estate in a portfolio). Extract ALL of them.
 
-EXCLUDE the following — these are NOT individual tenancies or comparables:
+EXCLUDE the following — these are NOT individual tenancies or occupational comparables:
 - **Portfolio / estate summary rows**: Aggregate lines that summarise an entire estate or portfolio (e.g. "Multiple tenants", "Various (15 units)", total WAULT, overall reversion %, overall vacancy %). These describe the whole property, not a single letting.
 - **Totals / subtotals rows**: Lines labelled "Total", "Sub-total", "Aggregate", or similar.
 - **The subject property's headline metrics** from the executive summary (e.g. total rent, total area, blended yield). These are deal-level figures, not individual tenancies.
+- **INVESTMENT COMPARABLES**: Tables or rows showing property SALES with columns like Net Initial Yield (NIY), Capital Value (Cap Val), AWULTC, Sale Price, or Purchaser/Vendor. These are investment transactions, NOT occupational lettings. Even if they appear on the same page as letting data, do NOT extract them here. If a table has yield, price, or cap val columns it is an investment comparable, not an occupational one.
 
 For each INDIVIDUAL entry (whether tenancy or comparable), extract:
 - **tenant_name**: Tenant / occupier name (null for rental comparables)
@@ -776,8 +778,7 @@ def _extract_deal_from_text(
         messages=[{"role": "user", "content": prompt}],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     return DealExtraction(
         date="",  # Not available from brochure
@@ -828,8 +829,7 @@ def _extract_investment_comps(
         }],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     # Handle CoVe format {"comparables": [...]} or legacy bare array [...]
     items = _unwrap_comps_response(data)
@@ -886,8 +886,7 @@ def _extract_occupational_comps(
         messages=[{"role": "user", "content": prompt}],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     if not isinstance(data, list):
         return []
@@ -979,8 +978,7 @@ def _verify_investment_comps(
             }],
         )
 
-        response_text = _strip_code_block(message.content[0].text.strip())
-        verdicts_data = json.loads(response_text)
+        verdicts_data = _parse_json_response(message.content[0].text.strip())
 
         verdicts = verdicts_data.get("verdicts", [])
         if not verdicts:
@@ -1080,8 +1078,7 @@ def _verify_investment_comps_vision(
             messages=[{"role": "user", "content": blocks}],
         )
 
-        response_text = _strip_code_block(message.content[0].text.strip())
-        verdicts_data = json.loads(response_text)
+        verdicts_data = _parse_json_response(message.content[0].text.strip())
 
         verdicts = verdicts_data.get("verdicts", [])
         if not verdicts:
@@ -1132,8 +1129,7 @@ def _extract_deal_from_vision(
         messages=[{"role": "user", "content": content}],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     return DealExtraction(
         date="",
@@ -1198,8 +1194,7 @@ def _extract_investment_comps_vision(
         messages=[{"role": "user", "content": blocks}],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     # Handle CoVe format {"comparables": [...]} or legacy bare array [...]
     items = _unwrap_comps_response(data)
@@ -1255,8 +1250,7 @@ def _extract_occupational_comps_vision(
         messages=[{"role": "user", "content": content}],
     )
 
-    response_text = _strip_code_block(message.content[0].text.strip())
-    data = json.loads(response_text)
+    data = _parse_json_response(message.content[0].text.strip())
 
     if not isinstance(data, list):
         return []
@@ -1355,6 +1349,70 @@ def _strip_code_block(text: str) -> str:
         json_lines = [l for l in lines if not l.strip().startswith("```")]
         return "\n".join(json_lines)
     return text
+
+
+def _parse_json_response(text: str):
+    """Robustly extract JSON from Claude's response.
+
+    Handles:
+    - Clean JSON (object or array)
+    - JSON wrapped in ```json ... ``` code blocks
+    - Leading/trailing commentary text outside the JSON
+
+    Returns a Python dict or list.
+    """
+    # 1. Strip code block markers
+    if "```" in text:
+        lines = text.split("\n")
+        json_lines = []
+        in_block = False
+        for line in lines:
+            if line.strip().startswith("```"):
+                in_block = not in_block
+                continue
+            if in_block:
+                json_lines.append(line)
+        if json_lines:
+            text = "\n".join(json_lines)
+
+    # 2. Try parsing the whole thing
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 3. Find the first top-level { ... } or [ ... ] via brace matching
+    for opener, closer in [("{", "}"), ("[", "]")]:
+        start = text.find(opener)
+        if start == -1:
+            continue
+        depth = 0
+        in_str = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    raise json.JSONDecodeError("No valid JSON found in response", text, 0)
 
 
 def _unwrap_comps_response(data) -> Optional[list]:

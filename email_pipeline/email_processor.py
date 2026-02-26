@@ -33,16 +33,18 @@ from email_pipeline.brochure_parser import parse_brochure
 from email_pipeline.excel_writer import (
     PipelineWriter,
     InvestmentCompsWriter,
-    OccupationalCompsWriter,
     is_deal_match,
 )
+from email_pipeline.occ_comps_db import RawOccCompsDB
 from email_pipeline.models import (
+    BrochureResult,
     ClassificationResult,
     DealExtraction,
     EmailSummary,
     ProcessingReport,
     ProcessingResult,
     ProcessingStatus,
+    PropertyGroup,
     ThreadSummary,
 )
 
@@ -111,6 +113,130 @@ def _is_stub_disqualified(name: str) -> bool:
     """
     name_lower = name.lower()
     return any(term in name_lower for term in STUB_DISQUALIFIERS)
+
+
+# ---------------------------------------------------------------------------
+# Early deduplication — group threads by property before expensive processing
+# ---------------------------------------------------------------------------
+
+def _select_best_thread(threads: list[ThreadSummary]) -> ThreadSummary:
+    """Pick the richest thread in a property group for full processing.
+
+    Scoring: +5 per attachment, +3 per email, +1 per 1k chars body preview.
+    Mirrors the existing _select_best_email() pattern.
+    """
+    if len(threads) == 1:
+        return threads[0]
+
+    def _score(t: ThreadSummary) -> float:
+        body_chars = sum(len(e.body_preview) for e in t.emails)
+        return len(t.all_attachment_names) * 5 + t.email_count * 3 + body_chars / 1000
+
+    return max(threads, key=_score)
+
+
+def _get_thread_property_name(
+    thread: ThreadSummary,
+    classifications: dict[str, ClassificationResult],
+) -> tuple[str, str]:
+    """Get suggested_asset_name and suggested_town for a thread.
+
+    Checks all emails in the thread against the classifications dict.
+    Falls back to extracting an asset name from the subject line.
+
+    Returns (asset_name, town).
+    """
+    # Try to find a classification with a suggested name
+    for email in thread.emails:
+        cls = classifications.get(email.gmail_message_id)
+        if cls and cls.suggested_asset_name:
+            return cls.suggested_asset_name, cls.suggested_town
+
+    # Fallback: extract from subject line (common for labelled emails that
+    # skipped AI classification)
+    name = _extract_asset_name_from_subject(thread.latest_subject)
+    return name, ""
+
+
+def _group_threads_by_property(
+    threads: list[ThreadSummary],
+    classifications: dict[str, ClassificationResult],
+) -> list[PropertyGroup]:
+    """Group threads that refer to the same property.
+
+    Uses is_deal_match() (5-tier fuzzy matching) to compare each thread's
+    suggested asset name / town against existing groups.  Threads that match
+    are merged into the same group; unmatched threads start a new group.
+
+    Returns a list of PropertyGroup, each with a winner thread and optionally
+    skipped threads + their agent domains.
+    """
+    groups: list[PropertyGroup] = []
+
+    # Build (thread, name, town) tuples
+    thread_props: list[tuple[ThreadSummary, str, str]] = []
+    for t in threads:
+        name, town = _get_thread_property_name(t, classifications)
+        thread_props.append((t, name, town))
+
+    for thread, name, town in thread_props:
+        matched_group = None
+        match_reason = ""
+
+        # Try to match against existing groups
+        for group in groups:
+            matched, reason = is_deal_match(
+                name_a=name,
+                town_a=town,
+                postcode_a="",  # Not available from classifier
+                name_b=group.canonical_name,
+                town_b=group.canonical_town,
+                postcode_b="",
+            )
+            if matched:
+                matched_group = group
+                match_reason = reason
+                break
+
+        if matched_group:
+            # Add to existing group
+            matched_group.skipped_threads.append(thread)
+            matched_group.match_reasons.append(match_reason)
+            # Collect sender domains from this thread
+            for domain in thread.all_sender_domains:
+                if domain not in matched_group.also_introduced_by:
+                    matched_group.also_introduced_by.append(domain)
+        else:
+            # Start a new group
+            groups.append(PropertyGroup(
+                canonical_name=name,
+                canonical_town=town,
+                winner=thread,
+                also_introduced_by=[],
+                skipped_threads=[],
+                match_reasons=[],
+            ))
+
+    # Now re-pick the winner in each group (the initial "winner" was just the
+    # first thread we saw — _select_best_thread picks the richest one).
+    for group in groups:
+        if group.skipped_threads:
+            all_threads = [group.winner] + group.skipped_threads
+            best = _select_best_thread(all_threads)
+            # Re-assign winner; everyone else is skipped
+            group.winner = best
+            group.skipped_threads = [t for t in all_threads if t is not best]
+
+            # Collect also_introduced_by: domains from skipped threads only
+            winner_domains = set(group.winner.all_sender_domains)
+            also_by: list[str] = []
+            for sk in group.skipped_threads:
+                for domain in sk.all_sender_domains:
+                    if domain not in winner_domains and domain not in also_by:
+                        also_by.append(domain)
+            group.also_introduced_by = also_by
+
+    return groups
 
 
 def process_emails(
@@ -353,12 +479,38 @@ def process_emails(
             return report
 
     # -----------------------------------------------------------------------
-    # Step 5: Group by thread, then process each thread as one introduction
+    # Step 5: Group by thread, then by property, then process
     # -----------------------------------------------------------------------
     intro_summaries = [s for s in new_summaries if s.gmail_message_id in intro_ids]
     threads = group_by_thread(intro_summaries)
 
-    print(f"\n[Step 4/6] Processing {len(intro_ids)} introductions across {len(threads)} thread(s)...")
+    # --- Step 5a: Early dedup — group threads by property ---
+    property_groups = _group_threads_by_property(threads, classifications)
+
+    multi_groups = [g for g in property_groups if g.skipped_threads]
+    total_threads = sum(1 + len(g.skipped_threads) for g in property_groups)
+    total_skipped = sum(len(g.skipped_threads) for g in property_groups)
+
+    if multi_groups:
+        print(f"\n  Early dedup: {len(property_groups)} unique properties from {total_threads} threads")
+        print(f"  {len(multi_groups)} property/ies received from multiple agents:")
+        for g in multi_groups:
+            all_domains = list(dict.fromkeys(
+                d for t in [g.winner] + g.skipped_threads
+                for d in t.all_sender_domains if d
+            ))
+            print(f"    • {g.canonical_town}, {g.canonical_name}  ({len(all_domains)} agents: {', '.join(all_domains)})")
+            print(f"      Winner: {g.winner.latest_subject[:55]} ({g.winner.email_count} emails, {len(g.winner.all_attachment_names)} attachments)")
+            for i, sk in enumerate(g.skipped_threads):
+                reason = g.match_reasons[i] if i < len(g.match_reasons) else "matched"
+                print(f"      Skip:   {sk.latest_subject[:55]} (from {', '.join(sk.all_sender_domains)}) [{reason}]")
+    else:
+        print(f"\n  No cross-agent duplicates detected ({len(property_groups)} unique properties from {total_threads} threads)")
+
+    report.early_dedup_groups = len(multi_groups)
+    report.early_dedup_threads_skipped = total_skipped
+
+    print(f"\n[Step 4/6] Processing {len(property_groups)} unique properties ({total_skipped} duplicate threads skipped)...")
 
     # Set up writers (with path validation)
     pipeline_writer = None
@@ -376,21 +528,38 @@ def process_emails(
         else:
             print(f"  ⚠ Investment Comps Excel not found: {investment_comps_path}")
 
-    occ_comps_writer = OccupationalCompsWriter(occupational_comps_path) if occupational_comps_path else None
+    # DB writer for raw occ comps (primary store)
+    raw_occ_db = None
+    if occupational_comps_path:
+        from config import get_db_path
+        raw_occ_db = RawOccCompsDB(get_db_path())
+        raw_occ_db.backup_db()
 
     # Cross-thread deduplicator: catches same deal across different Gmail threads
+    # (safety net — early dedup should handle most cases now)
     run_dedup = _RunDeduplicator()
 
-    for idx, thread in enumerate(threads, 1):
-        best = _select_best_email(thread.emails)
+    # Cross-thread brochure cache: avoids re-parsing the same PDF filename
+    brochure_cache: dict[str, BrochureResult] = {}
 
-        if thread.email_count > 1:
-            print(f"\n  [{idx}/{len(threads)}] Thread: {thread.latest_subject[:60]} ({thread.email_count} emails)")
+    for idx, group in enumerate(property_groups, 1):
+        thread = group.winner
+        best = _select_best_email(thread.emails)
+        also_intro_str = ", ".join(group.also_introduced_by)
+
+        if group.skipped_threads:
+            print(f"\n  [{idx}/{len(property_groups)}] Property: {group.canonical_town}, {group.canonical_name}")
+            print(f"    Winner thread: {best.subject[:55]}")
+            if also_intro_str:
+                print(f"    Also introduced by: {also_intro_str}")
+        elif thread.email_count > 1:
+            print(f"\n  [{idx}/{len(property_groups)}] Thread: {thread.latest_subject[:60]} ({thread.email_count} emails)")
             print(f"    Best email: {best.subject[:60]}")
         else:
-            print(f"\n  [{idx}/{len(threads)}] Processing: {best.subject[:60]}")
+            print(f"\n  [{idx}/{len(property_groups)}] Processing: {best.subject[:60]}")
 
         try:
+            # --- Process WINNER thread (full pipeline) ---
             result = _process_thread(
                 service=service,
                 api_key=api_key,
@@ -399,11 +568,13 @@ def process_emails(
                 archive_root=archive_root,
                 pipeline_writer=pipeline_writer,
                 inv_comps_writer=inv_comps_writer,
-                occ_comps_writer=occ_comps_writer,
                 run_dedup=run_dedup,
+                also_introduced_by=also_intro_str,
+                brochure_cache=brochure_cache,
+                raw_occ_db=raw_occ_db,
             )
 
-            # Update report
+            # Update report from winner
             if result.status == ProcessingStatus.PROCESSED:
                 report.successfully_processed += 1
                 report.threads_processed += 1
@@ -418,7 +589,7 @@ def process_emails(
                     f"{thread.latest_subject[:40]}: {result.error_message}"
                 )
 
-            # Mark ALL emails in thread as processed in database
+            # Mark winner thread emails in database
             for email in thread.emails:
                 db.mark_processed(
                     gmail_message_id=email.gmail_message_id,
@@ -449,10 +620,69 @@ def process_emails(
                     ),
                 )
 
+            # --- Process SKIPPED threads (archive + brochure only) ---
+            for sk_idx, sk_thread in enumerate(group.skipped_threads):
+                match_reason = group.match_reasons[sk_idx] if sk_idx < len(group.match_reasons) else "matched"
+                sk_best = _select_best_email(sk_thread.emails)
+                print(f"    Skipped thread [{sk_idx+1}/{len(group.skipped_threads)}]: {sk_best.subject[:55]} (from {', '.join(sk_thread.all_sender_domains)})")
+
+                try:
+                    sk_result = _process_skipped_thread(
+                        service=service,
+                        api_key=api_key,
+                        thread=sk_thread,
+                        archive_root=archive_root,
+                        source_deal_name=f"{group.canonical_town}, {group.canonical_name}",
+                        inv_comps_writer=inv_comps_writer,
+                        brochure_cache=brochure_cache,
+                        raw_occ_db=raw_occ_db,
+                    )
+
+                    # Aggregate skipped thread stats into report
+                    report.emails_archived += len(sk_result.archive_folders)
+                    report.brochures_parsed += sk_result.brochures_parsed
+                    report.investment_comps_added += len(sk_result.investment_comps)
+                    report.occupational_comps_added += len(sk_result.occupational_comps)
+
+                    # Mark skipped thread emails in database
+                    for email in sk_thread.emails:
+                        db.mark_processed(
+                            gmail_message_id=email.gmail_message_id,
+                            subject=email.subject,
+                            sender=email.sender,
+                            sender_domain=email.sender_domain,
+                            email_date=email.date,
+                            status="skipped",
+                            is_introduction=True,
+                            classification_reason=f"Early dedup: same as {group.canonical_name} ({match_reason})",
+                            deal_asset_name=group.canonical_name,
+                            deal_town=group.canonical_town,
+                            archive_folder=sk_result.archive_folders[0] if sk_result.archive_folders else "",
+                            pipeline_row_added=False,
+                            brochures_parsed=sk_result.brochures_parsed,
+                        )
+
+                except Exception as e:
+                    logger.error("    Error processing skipped thread %s: %s", sk_thread.thread_id, e)
+                    report.errors += 1
+                    report.error_details.append(f"Skipped: {sk_thread.latest_subject[:30]}: {e}")
+                    for email in sk_thread.emails:
+                        db.mark_processed(
+                            gmail_message_id=email.gmail_message_id,
+                            subject=email.subject,
+                            sender=email.sender,
+                            sender_domain=email.sender_domain,
+                            email_date=email.date,
+                            status="error",
+                            is_introduction=True,
+                            classification_reason=f"Early dedup: same as {group.canonical_name} ({match_reason})",
+                            error_message=str(e),
+                        )
+
         except Exception as e:
-            logger.error("  Error processing thread %s: %s", thread.thread_id, e)
+            logger.error("  Error processing group %s: %s", group.canonical_name, e)
             report.errors += 1
-            report.error_details.append(f"{thread.latest_subject[:40]}: {e}")
+            report.error_details.append(f"{group.canonical_name}: {e}")
 
             for email in thread.emails:
                 db.mark_processed(
@@ -487,17 +717,34 @@ def process_emails(
     if investment_comps_path and investment_comps_path.exists() and report.investment_comps_added > 0:
         _backup_file(investment_comps_path)
 
-    if occupational_comps_path and occupational_comps_path.exists() and report.occupational_comps_added > 0:
-        _backup_file(occupational_comps_path)
+    if report.occupational_comps_added > 0:
+        # DB dedup — removes vacant, investment comps, no-rent, duplicates
+        try:
+            from config import get_db_path as _get_db_path
+            _raw_db = RawOccCompsDB(_get_db_path())
+            dedup_summary = _raw_db.run_full_dedup(fix=True)
+            removed = dedup_summary.get("rows_removed", 0)
+            if removed > 0:
+                print(f"  DB Dedup: removed {removed} rows "
+                      f"({dedup_summary.get('duplicate_pairs', 0)} dupes, "
+                      f"{dedup_summary.get('vacant_rows', 0)} vacant, "
+                      f"{dedup_summary.get('inv_comp_rows', 0)} inv comps, "
+                      f"{dedup_summary.get('no_rent_rows', 0)} no-rent)")
+            else:
+                print(f"  DB Dedup: no duplicates or invalid rows found")
+        except Exception as e:
+            logger.warning("  DB occ comps dedup failed: %s", e)
+            print(f"  ⚠ DB occ comps dedup failed: {e}")
 
         # Cleaning pass for occ comps (once per run)
+        # Reads from DB, writes cleaned DB + both Excel exports
         try:
             from email_pipeline.occ_comps_cleaner import clean_occupational_comps
             from config import get_cleaned_occupational_comps_path, get_db_path
 
             cleaned_path = get_cleaned_occupational_comps_path()
             db_path = get_db_path()
-            if cleaned_path:
+            if cleaned_path and occupational_comps_path:
                 summary = clean_occupational_comps(
                     raw_excel_path=occupational_comps_path,
                     cleaned_excel_path=cleaned_path,
@@ -586,15 +833,17 @@ def _process_thread(
     archive_root: Path,
     pipeline_writer: Optional[PipelineWriter],
     inv_comps_writer: Optional[InvestmentCompsWriter],
-    occ_comps_writer: Optional[OccupationalCompsWriter],
     run_dedup: Optional[_RunDeduplicator] = None,
+    also_introduced_by: str = "",
+    brochure_cache: Optional[dict[str, "BrochureResult"]] = None,
+    raw_occ_db: Optional[RawOccCompsDB] = None,
 ) -> ProcessingResult:
     """Process all emails in a thread as a single introduction.
 
     1. Extract deals from the best email (most attachments/content)
     2. Archive ALL emails in the thread
-    3. Parse brochures from ALL archive folders (deduped by filename)
-    4. Write ONE pipeline row per deal (with cross-thread dedup)
+    3. Parse brochures from ALL archive folders (deduped by filename, with cross-thread cache)
+    4. Write ONE pipeline row per deal (with cross-thread dedup + also_introduced_by)
     """
     all_ids = [e.gmail_message_id for e in thread.emails]
     result = ProcessingResult(
@@ -762,12 +1011,22 @@ def _process_thread(
                     for bp in all_brochure_paths:
                         try:
                             primary_deal = deals[0]
-                            br = parse_brochure(
-                                file_path=bp,
-                                api_key=api_key,
-                                source_deal=f"{primary_deal.town}, {primary_deal.asset_name}",
-                            )
-                            result.brochures_parsed += 1
+                            source_deal_label = f"{primary_deal.town}, {primary_deal.asset_name}"
+
+                            # Check cross-thread brochure cache first
+                            if brochure_cache is not None and bp.name in brochure_cache:
+                                br = brochure_cache[bp.name]
+                                print(f"    ✓ Brochure cached: {bp.name}")
+                            else:
+                                br = parse_brochure(
+                                    file_path=bp,
+                                    api_key=api_key,
+                                    source_deal=source_deal_label,
+                                )
+                                result.brochures_parsed += 1
+                                # Store in cache for other threads with the same file
+                                if brochure_cache is not None:
+                                    brochure_cache[bp.name] = br
 
                             if br.error_message:
                                 print(f"    ⚠ Brochure: {br.error_message}")
@@ -782,7 +1041,7 @@ def _process_thread(
 
                             if br.investment_comps:
                                 for comp in br.investment_comps:
-                                    comp.source_deal = f"{primary_deal.town}, {primary_deal.asset_name}"
+                                    comp.source_deal = source_deal_label
                                     comp.source_file_path = str(bp)
                             if br.occupational_comps:
                                 for comp in br.occupational_comps:
@@ -827,6 +1086,7 @@ def _process_thread(
                     has_brochure=has_brochure if i == 0 else False,
                     brochure_scraped=brochure_scraped if i == 0 else False,
                     comment="Auto-imported",
+                    also_introduced_by=also_introduced_by if i == 0 else "",
                 )
                 if row_added:
                     result.pipeline_rows_added += 1
@@ -842,10 +1102,11 @@ def _process_thread(
             count = inv_comps_writer.append_comps(result.investment_comps)
             print(f"    ✓ {count} investment comps written")
 
-        if occ_comps_writer and result.occupational_comps:
+        if raw_occ_db and result.occupational_comps:
             print(f"    → Writing {len(result.occupational_comps)} occupational comps...")
-            count = occ_comps_writer.append_comps(result.occupational_comps)
-            print(f"    ✓ {count} occupational comps written")
+            for comp in result.occupational_comps:
+                raw_occ_db.insert_comp(comp)
+            print(f"    ✓ {len(result.occupational_comps)} occupational comps written to DB")
 
         if thread.email_count > 1:
             print(f"    ✓ Thread complete: {thread.email_count} emails → {result.pipeline_rows_added} pipeline row(s)")
@@ -1066,3 +1327,159 @@ def _try_rename_property_folders(
             print(f"    ✓ Renamed folder: {current_name} → {ideal_name}")
         except OSError as e:
             logger.warning("    Failed to rename folder %s → %s: %s", current_name, ideal_name, e)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight processing for skipped (early-dedup) threads
+# ---------------------------------------------------------------------------
+
+def _process_skipped_thread(
+    service,
+    api_key: str,
+    thread: ThreadSummary,
+    archive_root: Path,
+    source_deal_name: str,
+    inv_comps_writer: Optional["InvestmentCompsWriter"] = None,
+    brochure_cache: Optional[dict[str, "BrochureResult"]] = None,
+    raw_occ_db: Optional["RawOccCompsDB"] = None,
+) -> ProcessingResult:
+    """Process a thread that was matched to an already-processed property.
+
+    Lightweight version of _process_thread():
+    - Archives emails + attachments (keeps individual agent folders)
+    - Parses brochures (using cache to avoid re-parsing same filenames)
+    - Writes comps to investment/occupational comps Excel
+    - Does NOT call classify_and_extract() (saves expensive API)
+    - Does NOT write to Pipeline Excel (winner thread already wrote the row)
+
+    Returns a ProcessingResult with comps/archive info for report aggregation.
+    """
+    all_ids = [e.gmail_message_id for e in thread.emails]
+    result = ProcessingResult(
+        gmail_message_id=thread.emails[0].gmail_message_id if thread.emails else "",
+        status=ProcessingStatus.PENDING,
+        is_introduction=True,
+        all_gmail_message_ids=all_ids,
+    )
+
+    try:
+        # --- Archive ALL emails in this thread ---
+        if archive_root:
+            print(f"      → Archiving {len(thread.emails)} email(s) (skipped thread)...")
+
+            # Create a stub deal for folder naming
+            stub_deal = DealExtraction(
+                date=thread.earliest_date,
+                agent=_extract_sender_domain(thread.emails[0].sender) if thread.emails else "",
+                asset_name=source_deal_name,
+            )
+
+            primary_email = thread.emails[0]
+            primary_subfolder = None
+
+            archive_folder = archive_email(
+                service=service,
+                gmail_message_id=primary_email.gmail_message_id,
+                deal=stub_deal,
+                archive_root=archive_root,
+                email_subject=primary_email.subject,
+                email_sender=primary_email.sender,
+                email_date=primary_email.date,
+            )
+            if archive_folder:
+                primary_subfolder = archive_folder
+                result.archive_folders.append(str(archive_folder))
+                print(f"      ✓ {archive_folder.parent.name}/{archive_folder.name}")
+
+            # Archive remaining thread emails into the same subfolder
+            for email in thread.emails[1:]:
+                if primary_subfolder and primary_subfolder.exists():
+                    _archive_thread_email_to_subfolder(
+                        service, email.gmail_message_id, primary_subfolder,
+                        email.subject, email.sender, email.date, stub_deal,
+                    )
+                    print(f"      ✓ {email.subject[:50]} → (same folder)")
+                else:
+                    alt_folder = archive_email(
+                        service=service,
+                        gmail_message_id=email.gmail_message_id,
+                        deal=stub_deal,
+                        archive_root=archive_root,
+                        email_subject=email.subject,
+                        email_sender=email.sender,
+                        email_date=email.date,
+                    )
+                    if alt_folder:
+                        result.archive_folders.append(str(alt_folder))
+
+        # --- Parse brochures (with caching) ---
+        if result.archive_folders:
+            all_brochure_paths = []
+            seen_filenames: set[str] = set()
+            for folder_str in result.archive_folders:
+                for bp in get_attachment_paths(Path(folder_str)):
+                    if bp.name not in seen_filenames:
+                        all_brochure_paths.append(bp)
+                        seen_filenames.add(bp.name)
+
+            if all_brochure_paths:
+                print(f"      → Parsing {len(all_brochure_paths)} brochure(s) (skipped thread)...")
+                for bp in all_brochure_paths:
+                    try:
+                        # Check cache first
+                        if brochure_cache is not None and bp.name in brochure_cache:
+                            br = brochure_cache[bp.name]
+                            print(f"      ✓ Brochure cached: {bp.name}")
+                        else:
+                            br = parse_brochure(
+                                file_path=bp,
+                                api_key=api_key,
+                                source_deal=source_deal_name,
+                            )
+                            result.brochures_parsed += 1
+                            if brochure_cache is not None:
+                                brochure_cache[bp.name] = br
+                            print(f"      ✓ Parsed: {bp.name}")
+
+                        if br.error_message:
+                            print(f"      ⚠ Brochure: {br.error_message}")
+
+                        # Collect comps (don't merge deal — winner already has it)
+                        if br.investment_comps:
+                            for comp in br.investment_comps:
+                                comp.source_deal = source_deal_name
+                                comp.source_file_path = str(bp)
+                            result.investment_comps.extend(br.investment_comps)
+                        if br.occupational_comps:
+                            for comp in br.occupational_comps:
+                                comp.source_file_path = str(bp)
+                            result.occupational_comps.extend(br.occupational_comps)
+
+                        if br.investment_comps:
+                            print(f"      ✓ Found {len(br.investment_comps)} investment comps")
+                        if br.occupational_comps:
+                            print(f"      ✓ Found {len(br.occupational_comps)} occupational comps")
+
+                    except Exception as e:
+                        logger.warning("      Failed to parse brochure %s: %s", bp.name, e)
+
+        # --- Write comparables ---
+        if inv_comps_writer and result.investment_comps:
+            print(f"      → Writing {len(result.investment_comps)} investment comps (from skipped thread)...")
+            count = inv_comps_writer.append_comps(result.investment_comps)
+            print(f"      ✓ {count} investment comps written")
+
+        if raw_occ_db and result.occupational_comps:
+            print(f"      → Writing {len(result.occupational_comps)} occupational comps (from skipped thread)...")
+            for comp in result.occupational_comps:
+                raw_occ_db.insert_comp(comp)
+            print(f"      ✓ {len(result.occupational_comps)} occupational comps written to DB")
+
+        result.status = ProcessingStatus.PROCESSED
+        return result
+
+    except Exception as e:
+        result.status = ProcessingStatus.ERROR
+        result.error_message = str(e)
+        logger.error("      Error (skipped thread): %s", e)
+        return result

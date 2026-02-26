@@ -20,7 +20,7 @@ class ProcessingStatus(Enum):
 
 @dataclass
 class DealExtraction:
-    """Structured investment deal data — maps to Pipeline Excel columns B-V."""
+    """Structured investment deal data — maps to Pipeline Excel columns B-W."""
 
     date: str                                  # B — DD/MM/YYYY
     agent: str                                 # C
@@ -146,6 +146,24 @@ class ThreadSummary:
 
 
 @dataclass
+class PropertyGroup:
+    """Threads grouped as the same property (early dedup).
+
+    After batch classification, threads whose suggested_asset_name / town
+    match via fuzzy matching are grouped together.  Only the "winner" thread
+    gets full AI extraction; the others are archived and brochure-parsed but
+    skip the expensive classify_and_extract() call and pipeline row write.
+    """
+
+    canonical_name: str                                          # Best asset name
+    canonical_town: str                                          # Best town
+    winner: ThreadSummary                                        # Thread for full processing
+    also_introduced_by: list[str] = field(default_factory=list)  # Agent domains from skipped threads
+    skipped_threads: list[ThreadSummary] = field(default_factory=list)
+    match_reasons: list[str] = field(default_factory=list)
+
+
+@dataclass
 class ClassificationResult:
     """Result of AI classification — is this email an investment introduction?"""
 
@@ -195,6 +213,8 @@ class ProcessingReport:
     classified_as_not_introduction: int = 0
     threads_processed: int = 0
     successfully_processed: int = 0
+    early_dedup_groups: int = 0           # Properties with 2+ threads grouped
+    early_dedup_threads_skipped: int = 0  # Threads skipped (AI extraction) by early dedup
     pipeline_rows_added: int = 0
     emails_archived: int = 0
     brochures_parsed: int = 0
@@ -214,6 +234,8 @@ class ProcessingReport:
             f"  Not introductions:       {self.classified_as_not_introduction}",
             f"  Threads processed:       {self.threads_processed}",
             f"  Successfully processed:  {self.successfully_processed}",
+            f"  Early dedup groups:      {self.early_dedup_groups}",
+            f"  Threads skipped (dedup): {self.early_dedup_threads_skipped}",
             f"  Pipeline rows added:     {self.pipeline_rows_added}",
             f"  Emails archived:         {self.emails_archived}",
             f"  Brochures parsed:        {self.brochures_parsed}",

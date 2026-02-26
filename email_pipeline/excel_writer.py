@@ -28,6 +28,29 @@ from pathlib import Path
 from typing import Optional
 
 from openpyxl import Workbook, load_workbook
+
+from email_pipeline.occ_comps_columns import (
+    RAW_HEADERS as _OCC_RAW_HEADERS,
+    COL_SOURCE as _COL_SOURCE,
+    COL_ENTRY_TYPE as _COL_ENTRY_TYPE,
+    COL_TENANT as _COL_TENANT,
+    COL_UNIT as _COL_UNIT,
+    COL_ADDRESS as _COL_ADDRESS,
+    COL_TOWN as _COL_TOWN,
+    COL_POSTCODE as _COL_POSTCODE,
+    COL_SIZE as _COL_SIZE,
+    COL_RENT_PA as _COL_RENT_PA,
+    COL_RENT_PSF as _COL_RENT_PSF,
+    COL_LEASE_START as _COL_LEASE_START,
+    COL_LEASE_EXPIRY as _COL_LEASE_EXPIRY,
+    COL_BREAK as _COL_BREAK,
+    COL_REVIEW as _COL_REVIEW,
+    COL_TERM as _COL_TERM,
+    COL_COMP_DATE as _COL_COMP_DATE,
+    COL_NOTES as _COL_NOTES,
+    COL_SOURCE_FILE as _COL_SOURCE_FILE,
+    COL_EXTRACTION_DATE as _COL_EXTRACTION_DATE,
+)
 from openpyxl.utils import get_column_letter
 
 from email_pipeline.models import (
@@ -174,7 +197,7 @@ class PipelineWriter:
         H=Classification, I=Area(acres), J=Area(sqft), K=Rent PA,
         L=Rent PSF, M=Asking Price, N=NY%, O=RY%, P=CapVal PSF,
         Q=Status, R=Considered, S=Initial IRR, T=Brochure Stored,
-        U=Brochure Scraped, V=Comment
+        U=Brochure Scraped, V=Comment, W=Also Introduced By
     """
 
     SHEET_NAME = "Intros"
@@ -204,6 +227,7 @@ class PipelineWriter:
         "brochure_stored": 20, # T
         "brochure_scraped": 21,  # U
         "comment": 22,         # V
+        "also_introduced_by": 23,  # W
     }
 
     def __init__(self, excel_path: Path):
@@ -222,6 +246,7 @@ class PipelineWriter:
         has_brochure: bool = False,
         brochure_scraped: bool = False,
         comment: str = "",
+        also_introduced_by: str = "",
     ) -> bool:
         """Append a deal to the Pipeline Excel.
 
@@ -235,6 +260,8 @@ class PipelineWriter:
             Whether brochure data was extracted.
         comment : str
             Optional comment (e.g. "Auto-imported from email pipeline").
+        also_introduced_by : str
+            Comma-separated agent domains that also introduced this deal.
 
         Returns
         -------
@@ -243,7 +270,7 @@ class PipelineWriter:
         """
         return _retry_write(
             self.excel_path,
-            lambda wb: self._do_append(wb, deal, has_brochure, brochure_scraped, comment),
+            lambda wb: self._do_append(wb, deal, has_brochure, brochure_scraped, comment, also_introduced_by),
         )
 
     def _do_append(
@@ -253,6 +280,7 @@ class PipelineWriter:
         has_brochure: bool,
         brochure_scraped: bool,
         comment: str,
+        also_introduced_by: str = "",
     ) -> bool:
         """Internal: append deal to the workbook."""
         if self.SHEET_NAME not in wb.sheetnames:
@@ -323,6 +351,9 @@ class PipelineWriter:
         if comment:
             ws.cell(row=next_row, column=col["comment"], value=comment)
 
+        if also_introduced_by:
+            ws.cell(row=next_row, column=col["also_introduced_by"], value=also_introduced_by)
+
         return True
 
     def _is_duplicate(self, ws, deal: DealExtraction) -> tuple[bool, str]:
@@ -384,7 +415,7 @@ class PipelineWriter:
 
     def _copy_row_format(self, ws, source_row: int, target_row: int):
         """Copy cell formatting from source row to target row."""
-        for col in range(2, 23):  # B to V
+        for col in range(2, 24):  # B to W
             source_cell = ws.cell(row=source_row, column=col)
             target_cell = ws.cell(row=target_row, column=col)
             if source_cell.has_style:
@@ -516,7 +547,7 @@ class InvestmentCompsWriter:
         self._copy_row_format(ws, format_row, row)
 
         if comp.date:
-            ws.cell(row=row, column=col["date"], value=comp.date)
+            ws.cell(row=row, column=col["date"], value=self._normalise_inv_date(comp.date))
         if comp.quarter:
             ws.cell(row=row, column=col["quarter"], value=comp.quarter)
 
@@ -569,7 +600,7 @@ class InvestmentCompsWriter:
 
         # Map: column index → comp value (matching _write_comp logic)
         field_map = {
-            col["date"]: comp.date,
+            col["date"]: self._normalise_inv_date(comp.date) if comp.date else None,
             col["quarter"]: comp.quarter,
             col["town"]: comp.town,
             col["style"]: comp.style,
@@ -674,20 +705,35 @@ class InvestmentCompsWriter:
             return True
         return False
 
+    @staticmethod
+    def _normalise_inv_date(date_str: str) -> str:
+        """Normalise an investment comp date string.
+
+        If the date is in MM/YYYY format (e.g. '03/2024'), convert it to
+        01/MM/YYYY (e.g. '01/03/2024').  All other formats pass through
+        unchanged.
+        """
+        if not date_str or not isinstance(date_str, str):
+            return date_str
+        stripped = date_str.strip()
+        m = re.match(r"^(\d{1,2})/(\d{4})$", stripped)
+        if m:
+            return f"01/{int(m.group(1)):02d}/{m.group(2)}"
+        return stripped
+
     def _find_duplicate_row(self, ws, comp: InvestmentComp) -> Optional[int]:
         """Find an existing row that matches this comp using fuzzy multi-field matching.
 
         A comp is a duplicate if ALL of the following match an existing row:
-          1. Price within ±5%  (required on both sides)
+          1. Price: if both have a price → must be within ±5%.
+                    If one has a price and the other doesn't → no match.
+                    If neither has a price → skip price check.
           2. Quarter within ±1 quarter  (skipped if either is missing)
           3. Address: fuzzy (normalised substring, word overlap, or SequenceMatcher ≥ 0.85)
 
         Returns the matching row number, or None if no match found.
         """
         comp_price = comp.price
-        if not comp_price:
-            return None  # can't dedup without price
-
         comp_quarter_ord = self._parse_quarter(comp.quarter)
 
         col_addr = self.COLUMNS["address"]
@@ -699,14 +745,21 @@ class InvestmentCompsWriter:
             if not existing_addr:
                 continue
 
-            # 1. Price check (required)
+            # 1. Price check
             existing_price = ws.cell(row=row, column=col_price).value
             try:
                 existing_price = float(existing_price)
             except (TypeError, ValueError):
-                continue  # no price → can't match
-            if not self._is_price_close(comp_price, existing_price):
+                existing_price = None
+
+            if comp_price and existing_price:
+                # Both have prices — must be within ±5%
+                if not self._is_price_close(comp_price, existing_price):
+                    continue
+            elif comp_price or existing_price:
+                # One has a price, the other doesn't — not a match
                 continue
+            # else: neither has a price — skip price check
 
             # 2. Quarter check (if both present, must be within ±1)
             existing_quarter = str(ws.cell(row=row, column=col_quarter).value or "").strip()
@@ -763,173 +816,57 @@ class OccupationalCompsWriter:
         P=Comp Date, Q=Notes, R=Source File, S=Extraction Date
     """
 
-    HEADERS = [
-        "Source Deal", "Entry Type", "Tenant", "Unit", "Address", "Town",
-        "Postcode", "Size (sqft)", "Rent PA", "Rent PSF", "Lease Start",
-        "Lease Expiry", "Break Date", "Review Date", "Term (yrs)",
-        "Comp Date", "Notes", "Source File", "Extraction Date",
-    ]
-
-    # Column indices (1-based)
-    COL_SOURCE = 1
-    COL_ENTRY_TYPE = 2
-    COL_TENANT = 3
-    COL_UNIT = 4
-    COL_ADDRESS = 5
-    COL_TOWN = 6
-    COL_POSTCODE = 7
-    COL_SIZE = 8
-    COL_RENT_PA = 9
-    COL_RENT_PSF = 10
-    COL_LEASE_START = 11
-    COL_LEASE_EXPIRY = 12
-    COL_BREAK = 13
-    COL_REVIEW = 14
-    COL_TERM = 15
-    COL_COMP_DATE = 16
-    COL_NOTES = 17
-    COL_SOURCE_FILE = 18
-    COL_EXTRACTION_DATE = 19
+    HEADERS = _OCC_RAW_HEADERS
+    COL_SOURCE = _COL_SOURCE
+    COL_ENTRY_TYPE = _COL_ENTRY_TYPE
+    COL_TENANT = _COL_TENANT
+    COL_UNIT = _COL_UNIT
+    COL_ADDRESS = _COL_ADDRESS
+    COL_TOWN = _COL_TOWN
+    COL_POSTCODE = _COL_POSTCODE
+    COL_SIZE = _COL_SIZE
+    COL_RENT_PA = _COL_RENT_PA
+    COL_RENT_PSF = _COL_RENT_PSF
+    COL_LEASE_START = _COL_LEASE_START
+    COL_LEASE_EXPIRY = _COL_LEASE_EXPIRY
+    COL_BREAK = _COL_BREAK
+    COL_REVIEW = _COL_REVIEW
+    COL_TERM = _COL_TERM
+    COL_COMP_DATE = _COL_COMP_DATE
+    COL_NOTES = _COL_NOTES
+    COL_SOURCE_FILE = _COL_SOURCE_FILE
+    COL_EXTRACTION_DATE = _COL_EXTRACTION_DATE
 
     def __init__(self, excel_path: Path):
         self.excel_path = Path(excel_path)
 
     def append_comps(self, comps: list[OccupationalComp]) -> int:
-        """Append occupational comparables to the Excel file.
+        """Append occupational comparables to the Excel file (no dedup).
+
+        DEPRECATED: Pipeline callers now write to RawOccCompsDB instead.
+        This method is kept for ad-hoc / manual use only.
 
         Creates the file with headers if it doesn't exist.
-
-        Parameters
-        ----------
-        comps : list[OccupationalComp]
-            Comparables to append.
-
-        Returns
-        -------
-        int
-            Number of comps successfully written.
         """
         if not comps:
             return 0
 
-        # Create file if it doesn't exist
         if not self.excel_path.exists():
             self._create_file()
 
-        written_comps: list[OccupationalComp] = []
+        written = 0
 
         def _write(wb):
+            nonlocal written
             ws = wb.active
-            print(f"\n  Writing {len(comps)} occ comps to {self.excel_path.name}...")
-
-            dupes = 0
-            merged = 0
-
-            for i, comp in enumerate(comps):
-                dup_row = self._find_duplicate_row(ws, comp)
-                if dup_row is not None:
-                    label = comp.tenant_name or comp.address
-                    fills = self._merge_into_row(ws, dup_row, comp)
-                    if fills:
-                        merged += 1
-                        print(f"    ⊘ Duplicate occ comp: {label} "
-                              f"(source: {comp.source_deal}) "
-                              f"— merged {fills} field(s) into row {dup_row}")
-                    else:
-                        print(f"    ⊘ Duplicate: {label} (source: {comp.source_deal})")
-                    logger.info("  Duplicate occ comp: %s — skipping (row %d, merged %d)",
-                                label, dup_row, fills)
-                    dupes += 1
-                    continue
-
+            for comp in comps:
                 next_row = self._find_next_row(ws)
                 self._write_comp(ws, next_row, comp)
-                written_comps.append(comp)
-
-            print(f"  → {len(written_comps)} written, "
-                  f"{dupes} duplicates skipped"
-                  f"{f' ({merged} with merge)' if merged else ''}")
-            return len(written_comps) > 0 or merged > 0
+                written += 1
+            return written > 0
 
         _retry_write(self.excel_path, _write)
-
-        # Post-save verification: OneDrive can overwrite the file with a
-        # stale cloud copy after we save.  If that happens, re-save from
-        # scratch using _create_file + a fresh write pass.
-        if written_comps:
-            self._verify_and_resave(written_comps, len(written_comps))
-
-        return len(written_comps)
-
-    def _verify_and_resave(self, comps: list["OccupationalComp"], expected: int):
-        """Re-read the file to make sure our rows actually persisted.
-
-        OneDrive can silently overwrite a freshly-saved file with an older
-        cloud version.  If we detect the rows are missing, we rebuild the
-        file contents in-memory and save again via a temp file (up to 3
-        attempts with a delay to let OneDrive settle).
-
-        Parameters
-        ----------
-        comps : list[OccupationalComp]
-            Only the comps that were actually written (duplicates excluded).
-        expected : int
-            Number of rows we expect to find.
-        """
-        import time as _time
-
-        for attempt in range(3):
-            _time.sleep(5)  # Give OneDrive time to settle
-            try:
-                wb = load_workbook(str(self.excel_path), data_only=False)
-                ws = wb.active
-                # Count non-empty data rows (source deal is always populated)
-                data_rows = 0
-                for r in range(2, ws.max_row + 1):
-                    if ws.cell(row=r, column=self.COL_SOURCE).value:
-                        data_rows += 1
-                wb.close()
-
-                if data_rows >= expected:
-                    print(f"  ✓ Verified: {data_rows} occ comp rows persisted")
-                    return  # All good
-
-                print(
-                    f"  ⚠ OneDrive overwrite detected: expected {expected} rows, "
-                    f"found {data_rows} — re-saving (attempt {attempt + 1}/3)"
-                )
-
-                # Re-build the file: open, clear, rewrite headers + comps
-                wb = load_workbook(str(self.excel_path), data_only=False)
-                ws = wb.active
-
-                # Clear any stale data
-                for row in range(2, ws.max_row + 1):
-                    for col in range(1, len(self.HEADERS) + 1):
-                        ws.cell(row=row, column=col).value = None
-
-                # Re-write only the non-duplicate comps
-                row_num = 2
-                for comp in comps:
-                    self._write_comp(ws, row_num, comp)
-                    row_num += 1
-
-                # Save via temp file to avoid another OneDrive race
-                fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-                os.close(fd)
-                try:
-                    wb.save(tmp_path)
-                    wb.close()
-                    shutil.copy2(tmp_path, str(self.excel_path))
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                print(f"  Re-saved {len(comps)} rows to {self.excel_path.name}")
-
-            except Exception as e:
-                print(f"  ⚠ Verification attempt {attempt + 1} failed: {e}")
+        return written
 
     def _create_file(self):
         """Create a new Excel file with headers."""
@@ -994,195 +931,9 @@ class OccupationalCompsWriter:
             ws.cell(row=row, column=self.COL_SOURCE_FILE, value=comp.source_file_path)
         ws.cell(row=row, column=self.COL_EXTRACTION_DATE, value=datetime.now().strftime("%d/%m/%Y"))
 
-    # --- Dedup helpers (occupational comps) ---
-
-    @staticmethod
-    def _normalise_tenant(name: str) -> str:
-        """Normalise a tenant name for comparison.
-
-        Lowercase, strip punctuation, collapse whitespace, and remove
-        common suffixes (Ltd, Limited, PLC, Inc) that vary between sources.
-        """
-        n = _normalize_name(name)
-        # Strip common company suffixes
-        n = re.sub(r'\b(ltd|limited|plc|inc|llp|llc)\b', '', n)
-        return re.sub(r'\s+', ' ', n).strip()
-
-    @staticmethod
-    def _normalise_unit(name: str) -> str:
-        """Normalise a unit name for comparison.
-
-        Lowercase, strip punctuation, strip 'unit'/'plot' prefixes,
-        strip leading zeros.
-        """
-        n = _normalize_name(name)
-        n = re.sub(r'\b0+(\d)', r'\1', n)        # "01" → "1"
-        n = re.sub(r'\bunit\b\s*', '', n)         # strip "unit" prefix
-        n = re.sub(r'\bplot\b\s*', '', n)         # strip "plot" prefix
-        return n.strip()
-
-    @staticmethod
-    def _is_rent_close(rent_a: Optional[float], rent_b: Optional[float],
-                       tolerance: float = 0.005) -> bool:
-        """Check if two rents are within ±tolerance of each other.
-
-        Default 0.5% tolerance handles rounding (e.g. £178,875 vs £178,876).
-        Returns False if either rent is None or zero.
-        """
-        if not rent_a or not rent_b:
-            return False
-        avg = (rent_a + rent_b) / 2
-        if avg == 0:
-            return False
-        return abs(rent_a - rent_b) / avg <= tolerance
-
-    def _find_duplicate_row(self, ws, comp: OccupationalComp) -> Optional[int]:
-        """Find an existing row that matches this comp.
-
-        Three-phase dedup:
-
-        Phase 1 — Normalised tenant name + rent PA within ±0.5%
-                  (catches same tenant from different source brochures)
-
-        Phase 2 — Exact normalised unit + rent PA within ±0.5%
-                  (catches same unit from different source brochures
-                   where tenant name may differ slightly)
-
-        Phase 3 — Fuzzy tenant name (SequenceMatcher ≥ 0.90) + rent PA
-                  within ±0.5%  (catches near-misspellings like
-                  "Planetbloom" vs "Planet Bloom")
-
-        Rows where tenant is "Vacant" are skipped entirely — they
-        are not meaningful for dedup.
-
-        Returns the matching row number, or None if no match found.
-        """
-        comp_tenant = self._normalise_tenant(comp.tenant_name or "")
-        comp_unit = self._normalise_unit(comp.unit_name or "")
-
-        # Skip explicitly "vacant" entries — not useful for dedup.
-        # Empty tenant is fine (comparables have no tenant).
-        if comp_tenant in ("vacant", "vacant under offer"):
-            return None
-
-        comp_rent = comp.rent_pa
-        comp_rent_psf = comp.rent_psf
-
-        for row in range(2, ws.max_row + 1):
-            existing_source = ws.cell(row=row, column=self.COL_SOURCE).value
-            if not existing_source:
-                continue
-
-            existing_tenant_raw = str(ws.cell(row=row, column=self.COL_TENANT).value or "").strip()
-            existing_tenant = self._normalise_tenant(existing_tenant_raw)
-
-            # Skip explicitly vacant rows in the sheet too
-            if existing_tenant in ("vacant", "vacant under offer"):
-                continue
-
-            existing_rent = ws.cell(row=row, column=self.COL_RENT_PA).value
-            try:
-                existing_rent = float(existing_rent) if existing_rent else None
-            except (TypeError, ValueError):
-                existing_rent = None
-
-            existing_rent_psf = ws.cell(row=row, column=self.COL_RENT_PSF).value
-            try:
-                existing_rent_psf = float(existing_rent_psf) if existing_rent_psf else None
-            except (TypeError, ValueError):
-                existing_rent_psf = None
-
-            # Helper: rent PA match, falling back to PSF when both PA are None
-            def _rents_match() -> bool:
-                if self._is_rent_close(comp_rent, existing_rent):
-                    return True
-                if comp_rent is None and existing_rent is None:
-                    return self._is_rent_close(comp_rent_psf, existing_rent_psf)
-                return False
-
-            # Phase 1: tenant name + rent
-            if comp_tenant and existing_tenant == comp_tenant:
-                if _rents_match():
-                    return row
-
-            # Phase 2: unit + rent (exact)
-            if comp_unit:
-                existing_unit = self._normalise_unit(
-                    str(ws.cell(row=row, column=self.COL_UNIT).value or "").strip()
-                )
-                if existing_unit and comp_unit == existing_unit:
-                    if _rents_match():
-                        return row
-
-            # Phase 3: fuzzy tenant name + rent
-            if (comp_tenant and existing_tenant
-                    and _rents_match()):
-                ratio = difflib.SequenceMatcher(
-                    None, comp_tenant, existing_tenant
-                ).ratio()
-                if ratio >= 0.90:
-                    logger.info(
-                        "  Fuzzy tenant match (%.0f%%): '%s' ~ '%s' (row %d)",
-                        ratio * 100, comp_tenant, existing_tenant, row,
-                    )
-                    return row
-
-        return None
-
-    def _merge_into_row(self, ws, row: int, comp: OccupationalComp) -> int:
-        """Merge data from a duplicate comp into an existing row.
-
-        For each column: if the existing cell is empty but the comp has a
-        value, copy the comp's value in.  Never overwrites existing data.
-
-        Returns the number of cells filled.
-        """
-        fills = 0
-
-        # Map: column index → comp value (matching _write_comp logic)
-        field_map = {
-            self.COL_TENANT: comp.tenant_name,
-            self.COL_UNIT: comp.unit_name,
-            self.COL_ADDRESS: comp.address,
-            self.COL_TOWN: comp.town,
-            self.COL_POSTCODE: comp.postcode,
-            self.COL_SIZE: comp.size_sqft,
-            self.COL_RENT_PA: comp.rent_pa,
-            self.COL_RENT_PSF: comp.rent_psf,
-            self.COL_LEASE_START: comp.lease_start,
-            self.COL_LEASE_EXPIRY: comp.lease_expiry,
-            self.COL_BREAK: comp.break_date,
-            self.COL_REVIEW: comp.rent_review_date,
-            self.COL_TERM: comp.lease_term_years,
-            self.COL_COMP_DATE: comp.comp_date,
-            self.COL_NOTES: comp.notes,
-        }
-
-        col_names = {
-            self.COL_TENANT: "Tenant", self.COL_UNIT: "Unit",
-            self.COL_ADDRESS: "Address", self.COL_TOWN: "Town",
-            self.COL_POSTCODE: "Postcode", self.COL_SIZE: "Size",
-            self.COL_RENT_PA: "Rent PA", self.COL_RENT_PSF: "Rent PSF",
-            self.COL_LEASE_START: "Lease Start", self.COL_LEASE_EXPIRY: "Lease Expiry",
-            self.COL_BREAK: "Break", self.COL_REVIEW: "Review",
-            self.COL_TERM: "Term", self.COL_COMP_DATE: "Comp Date",
-            self.COL_NOTES: "Notes",
-        }
-
-        for col_idx, new_val in field_map.items():
-            if new_val is None:
-                continue
-            if isinstance(new_val, str) and not new_val.strip():
-                continue
-            existing = ws.cell(row=row, column=col_idx).value
-            if existing is not None and str(existing).strip() != "":
-                continue  # already has data — don't overwrite
-            ws.cell(row=row, column=col_idx, value=new_val)
-            fills += 1
-            logger.debug("  Row %d, %s: ← %s", row,
-                         col_names.get(col_idx, f"Col {col_idx}"), new_val)
-
-        return fills
+    # NOTE: Dedup/merge methods removed in Phase 4 of database-primary migration.
+    # All dedup logic now lives in RawOccCompsDB (email_pipeline/occ_comps_db.py).
+    # This class is no longer used by the pipeline — kept for ad-hoc use only.
 
     def _find_next_row(self, ws) -> int:
         """Find the next empty row (scanning column A = source deal, always populated)."""

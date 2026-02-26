@@ -38,6 +38,9 @@ class Database:
     def _init_db(self):
         """Create tables if they don't exist."""
         with sqlite3.connect(self.db_path) as conn:
+            # Enable WAL mode for concurrent read safety
+            conn.execute("PRAGMA journal_mode=WAL")
+
             # Processed emails — idempotency tracking
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS processed_emails (
@@ -131,6 +134,59 @@ class Database:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_rent_psf ON cleaned_occupational_comps(rent_psf)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_size ON cleaned_occupational_comps(size_sqft)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_occ_source_deal ON cleaned_occupational_comps(source_deal)")
+
+            # Raw occupational comparables — primary data store
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS raw_occupational_comps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_deal TEXT NOT NULL,
+                    entry_type TEXT NOT NULL DEFAULT 'tenancy',
+                    tenant_name TEXT,
+                    tenant_name_norm TEXT,
+                    unit_name TEXT,
+                    unit_name_norm TEXT,
+                    address TEXT,
+                    town TEXT,
+                    postcode TEXT,
+                    size_sqft REAL,
+                    rent_pa REAL,
+                    rent_psf REAL,
+                    lease_start TEXT,
+                    lease_expiry TEXT,
+                    break_date TEXT,
+                    rent_review_date TEXT,
+                    lease_term_years REAL,
+                    comp_date TEXT,
+                    notes TEXT,
+                    source_file_path TEXT,
+                    extraction_date TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_occ_source_deal ON raw_occupational_comps(source_deal)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_occ_tenant_norm ON raw_occupational_comps(tenant_name_norm)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_occ_unit_norm ON raw_occupational_comps(unit_name_norm)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_occ_town ON raw_occupational_comps(town)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_raw_occ_postcode ON raw_occupational_comps(postcode)")
+
+            # Change log — audit trail for occ comps modifications
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS occ_comps_change_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    raw_comp_id INTEGER,
+                    source_deal TEXT,
+                    tenant_name TEXT,
+                    field_name TEXT,
+                    old_value TEXT,
+                    new_value TEXT,
+                    context TEXT
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changelog_timestamp ON occ_comps_change_log(timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_changelog_action ON occ_comps_change_log(action)")
 
             conn.commit()
 

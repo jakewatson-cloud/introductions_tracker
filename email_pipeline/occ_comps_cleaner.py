@@ -21,6 +21,8 @@ Rules (applied in cascade order):
 
 Post-enrichment filters:
     - Remove rows still missing unit size after all derivation rules
+    - Remove misclassified investment comps (NIY, yield, cap val in notes)
+    - Remove "available" units (comp_date or notes say available/available now)
 
 Called automatically after OccupationalCompsWriter.append_comps() completes.
 Also callable standalone from the GUI "Clean Occ Comps" button.
@@ -48,40 +50,17 @@ from openpyxl.utils import get_column_letter
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants — must match OccupationalCompsWriter in excel_writer.py
+# Constants — imported from central module
 # ---------------------------------------------------------------------------
 
-COL_SOURCE = 1
-COL_ENTRY_TYPE = 2
-COL_TENANT = 3
-COL_UNIT = 4
-COL_ADDRESS = 5
-COL_TOWN = 6
-COL_POSTCODE = 7
-COL_SIZE = 8
-COL_RENT_PA = 9
-COL_RENT_PSF = 10
-COL_LEASE_START = 11
-COL_LEASE_EXPIRY = 12
-COL_BREAK = 13
-COL_REVIEW = 14
-COL_TERM = 15
-COL_COMP_DATE = 16
-COL_NOTES = 17
-COL_SOURCE_FILE = 18
-COL_EXTRACTION_DATE = 19
-COL_TOTAL_ADDRESS = 20  # New column in cleaned file
-
-CLEANED_HEADERS = [
-    "Source Deal", "Entry Type", "Tenant", "Unit", "Address", "Town",
-    "Postcode", "Size (sqft)", "Rent PA", "Rent PSF", "Lease Start",
-    "Lease Expiry", "Break Date", "Review Date", "Term (yrs)",
-    "Comp Date", "Notes", "Source File", "Extraction Date",
-    "Total Address",
-]
-
-DATE_COLUMNS = ["lease_start", "lease_expiry", "break_date",
-                "rent_review_date", "comp_date"]
+from email_pipeline.occ_comps_columns import (
+    COL_SOURCE, COL_ENTRY_TYPE, COL_TENANT, COL_UNIT,
+    COL_ADDRESS, COL_TOWN, COL_POSTCODE, COL_SIZE,
+    COL_RENT_PA, COL_RENT_PSF, COL_LEASE_START, COL_LEASE_EXPIRY,
+    COL_BREAK, COL_REVIEW, COL_TERM, COL_COMP_DATE,
+    COL_NOTES, COL_SOURCE_FILE, COL_EXTRACTION_DATE,
+    COL_TOTAL_ADDRESS, CLEANED_HEADERS, DATE_COLUMNS,
+)
 
 # UK postcode regex (same as email_archiver.py)
 _UK_POSTCODE_RE = re.compile(
@@ -119,6 +98,39 @@ _POSTCODES_IO_PLACES_URL = "https://api.postcodes.io/places"
 _POSTCODES_IO_BATCH_SIZE = 100
 
 
+# Investment comp keywords — standalone words or followed by : or -
+# Matches: "NIY", "niy:", "Yield-", "cap val", "Cap Val:", "capital value" etc.
+_INVESTMENT_KW_RE = re.compile(
+    r"\b(?:NIY|yield|cap(?:ital)?\s*val(?:ue)?)\s*[:\-]?"
+    r"|\b(?:NIY|yield|cap(?:ital)?\s*val(?:ue)?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_investment_comp(row: dict) -> bool:
+    """Return True if the row's notes contain investment comp keywords."""
+    notes = (row.get("notes") or "").strip()
+    if not notes:
+        return False
+    return bool(_INVESTMENT_KW_RE.search(notes))
+
+
+# "Available" / "Available Now" — units listed as available are marketing
+# descriptions, not completed lettings.  Can appear in comp_date or notes.
+_AVAILABLE_RE = re.compile(r"\bavailable(?:\s+now)?\b", re.IGNORECASE)
+
+
+def _is_available_unit(row: dict) -> bool:
+    """Return True if comp_date or notes indicate an available (unlettable) unit."""
+    for key in ("comp_date", "notes"):
+        val = row.get(key)
+        if val is not None:
+            text = str(val).strip()
+            if text and _AVAILABLE_RE.search(text):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -130,10 +142,15 @@ def clean_occupational_comps(
 ) -> dict:
     """Run the cleaning pipeline over raw occupational comparables.
 
+    Reads raw data from the DB (raw_occupational_comps table) as the
+    primary source.  Falls back to the raw Excel file if the DB table
+    is empty (pre-migration compatibility).
+
     Parameters
     ----------
     raw_excel_path : Path
-        Path to the raw OCCUPATIONAL COMPARABLES.xlsx.
+        Path to the raw OCCUPATIONAL COMPARABLES.xlsx (used as fallback
+        and for exporting the enriched raw data after cleaning).
     cleaned_excel_path : Path
         Path to write the cleaned Excel file.
     db_path : Path
@@ -155,13 +172,16 @@ def clean_occupational_comps(
         "db_rows": 0,
     }
 
-    if not raw_excel_path.exists():
-        print(f"  Raw file not found: {raw_excel_path}")
+    # Step 1: Read raw rows from DB
+    from email_pipeline.occ_comps_db import RawOccCompsDB
+    raw_db = RawOccCompsDB(db_path)
+    row_count = raw_db.row_count()
+    if row_count == 0:
+        print("  No data in database")
         return summary
+    print(f"  Reading raw data from database ({row_count} rows)...")
+    rows = raw_db.get_all_raw()
 
-    # Step 1: Read raw rows
-    print(f"  Reading raw data from {raw_excel_path.name}...")
-    rows = _read_raw_rows(raw_excel_path)
     if not rows:
         print("  No data rows found")
         return summary
@@ -227,9 +247,19 @@ def clean_occupational_comps(
     changes = 0
     for i, row in enumerate(rows):
         row_num = i + 2  # Excel row (1-indexed, row 1 is headers)
+        # Snapshot location fields before cleaning
+        pre_addr = (row.get("address") or "").strip()
+        pre_town = (row.get("town") or "").strip()
+        pre_pc = (row.get("postcode") or "").strip()
         row_changes = _clean_row(row, row_num, postcode_cache, places_cache,
                                  summary["details"])
         changes += row_changes
+        # Flag if any location field was enriched (for DB write-back)
+        post_addr = (row.get("address") or "").strip()
+        post_town = (row.get("town") or "").strip()
+        post_pc = (row.get("postcode") or "").strip()
+        if post_addr != pre_addr or post_town != pre_town or post_pc != pre_pc:
+            row["_location_changed"] = True
 
     # Step 3b: Use Haiku to infer postcodes for rows still missing them.
     # Collect unique (address, town) combos that need a postcode.
@@ -275,6 +305,7 @@ def clean_occupational_comps(
                 row = rows[idx]
                 row_num = idx + 2
                 row["postcode"] = norm_pc
+                row["_location_changed"] = True
                 changes += 1
                 resolved += 1
                 summary["details"].append(
@@ -301,11 +332,18 @@ def clean_occupational_comps(
         print(f"  {resolved} postcode(s) filled via Haiku "
               f"({len(needs_postcode) - len(haiku_postcodes)} unresolved)")
 
-    # Step 3c: Write enriched location data back to the raw file so that
+    # Step 3c: Write enriched location data back to the raw store so that
     # Haiku / places lookups don't repeat on future runs.  We only write
     # address, town, and postcode — columns that may have been blank
     # and are now filled by rules 1b, 1c, 2, 3, and 3b.
-    _write_back_locations(rows, raw_excel_path)
+    # Write enriched location data back to the DB
+    location_updates = [
+        r for r in rows
+        if r.get("id") and r.get("_location_changed")
+    ]
+    if location_updates:
+        updated = raw_db.update_locations(location_updates)
+        print(f"  {updated} row(s) enriched in database")
 
     summary["cells_filled"] = changes
     print(f"  {changes} cells filled across {len(rows)} rows")
@@ -323,121 +361,54 @@ def clean_occupational_comps(
         )
     summary["no_size_removed"] = no_size_removed
 
+    # Step 3e: Remove misclassified investment comps.
+    # If the notes column contains investment-specific terms (NIY, yield,
+    # cap val) the row is an investment transaction, not an occupational
+    # letting.  Match as standalone words or followed by : or -.
+    before_count = len(rows)
+    rows = [r for r in rows if not _is_investment_comp(r)]
+    inv_removed = before_count - len(rows)
+    if inv_removed > 0:
+        print(f"  Removed {inv_removed} misclassified investment comp(s)")
+        summary["details"].append(
+            f"Removed {inv_removed} row(s) with investment comp keywords in notes"
+        )
+    summary["investment_comps_removed"] = inv_removed
+
+    # Step 3f: Remove "available" units.
+    # Rows where comp_date or notes say "Available" / "Available Now" are
+    # marketing listings for vacant space, not completed lettings.
+    before_count = len(rows)
+    rows = [r for r in rows if not _is_available_unit(r)]
+    avail_removed = before_count - len(rows)
+    if avail_removed > 0:
+        print(f"  Removed {avail_removed} 'available' unit(s)")
+        summary["details"].append(
+            f"Removed {avail_removed} row(s) marked as available/available now"
+        )
+    summary["available_removed"] = avail_removed
+
     # Step 4: Write cleaned Excel
     print(f"  Writing cleaned data to {cleaned_excel_path.name}...")
     _write_cleaned_excel(rows, cleaned_excel_path)
 
-    # Step 5: Insert into database
+    # Step 5: Insert into database (atomic: BEGIN IMMEDIATE ensures
+    # readers never see an empty table mid-rebuild)
     print(f"  Inserting into database...")
     db_rows = _insert_into_db(rows, db_path)
     summary["db_rows"] = db_rows
     print(f"  {db_rows} rows upserted into cleaned_occupational_comps")
 
+    # Step 6: Export raw data to Excel (convenience view from DB)
+    print(f"  Exporting raw data to {raw_excel_path.name}...")
+    raw_db.export_to_excel(raw_excel_path)
+
     return summary
 
 
-# ---------------------------------------------------------------------------
-# CSV snapshot (audit trail for raw data)
-# ---------------------------------------------------------------------------
-
-def snapshot_raw_csv(raw_excel_path: Path):
-    """Save a timestamped CSV snapshot of the raw occupational comps.
-
-    Creates a snapshots/ subfolder next to the raw Excel file and writes
-    a CSV named like ``occ_comps_raw_20260217_143022.csv``.  These are
-    lightweight, append-only, and give a full audit trail of every
-    extraction run.
-    """
-    raw_excel_path = Path(raw_excel_path)
-    if not raw_excel_path.exists():
-        return
-
-    snapshot_dir = raw_excel_path.parent / "snapshots"
-    snapshot_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = snapshot_dir / f"occ_comps_raw_{timestamp}.csv"
-
-    rows = _read_raw_rows(raw_excel_path)
-    if not rows:
-        return
-
-    # Use the raw Excel headers (excluding Total Address which is cleaned-only)
-    fieldnames = [
-        "source_deal", "entry_type", "tenant_name", "unit_name",
-        "address", "town", "postcode", "size_sqft", "rent_pa", "rent_psf",
-        "lease_start", "lease_expiry", "break_date", "rent_review_date",
-        "lease_term_years", "comp_date", "notes", "source_file_path",
-        "extraction_date",
-    ]
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-
-    logger.info("  Raw CSV snapshot: %s (%d rows)", csv_path.name, len(rows))
-    print(f"  Raw CSV snapshot: {csv_path.name} ({len(rows)} rows)")
-
-
-# ---------------------------------------------------------------------------
-# Read raw rows from Excel
-# ---------------------------------------------------------------------------
-
-def _read_raw_rows(excel_path: Path) -> list[dict]:
-    """Read all data rows from the raw occupational comps Excel."""
-    rows = []
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            wb = load_workbook(str(excel_path), data_only=False)
-            ws = wb.active
-
-            for r in range(2, ws.max_row + 1):
-                # Skip empty rows
-                if not ws.cell(row=r, column=COL_SOURCE).value:
-                    continue
-
-                row = {
-                    "source_deal": str(ws.cell(row=r, column=COL_SOURCE).value or ""),
-                    "entry_type": str(ws.cell(row=r, column=COL_ENTRY_TYPE).value or "tenancy"),
-                    "tenant_name": str(ws.cell(row=r, column=COL_TENANT).value or ""),
-                    "unit_name": str(ws.cell(row=r, column=COL_UNIT).value or ""),
-                    "address": str(ws.cell(row=r, column=COL_ADDRESS).value or ""),
-                    "town": str(ws.cell(row=r, column=COL_TOWN).value or ""),
-                    "postcode": str(ws.cell(row=r, column=COL_POSTCODE).value or ""),
-                    "size_sqft": _to_number(ws.cell(row=r, column=COL_SIZE).value),
-                    "rent_pa": _to_number(ws.cell(row=r, column=COL_RENT_PA).value),
-                    "rent_psf": _to_number(ws.cell(row=r, column=COL_RENT_PSF).value),
-                    "lease_start": ws.cell(row=r, column=COL_LEASE_START).value,
-                    "lease_expiry": ws.cell(row=r, column=COL_LEASE_EXPIRY).value,
-                    "break_date": ws.cell(row=r, column=COL_BREAK).value,
-                    "rent_review_date": ws.cell(row=r, column=COL_REVIEW).value,
-                    "lease_term_years": _to_number(ws.cell(row=r, column=COL_TERM).value),
-                    "comp_date": ws.cell(row=r, column=COL_COMP_DATE).value,
-                    "notes": str(ws.cell(row=r, column=COL_NOTES).value or ""),
-                    "source_file_path": str(ws.cell(row=r, column=COL_SOURCE_FILE).value or ""),
-                    "extraction_date": str(ws.cell(row=r, column=COL_EXTRACTION_DATE).value or ""),
-                }
-                rows.append(row)
-
-            wb.close()
-            return rows
-
-        except PermissionError as e:
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAY * (2 ** attempt)
-                print(f"  File locked, retrying in {wait}s: {e}")
-                time.sleep(wait)
-            else:
-                print(f"  File locked after {MAX_RETRIES} attempts: {e}")
-                return rows
-
-        except Exception as e:
-            print(f"  Error reading raw file: {e}")
-            return rows
-
-    return rows
+    # NOTE: snapshot_raw_csv() and _read_raw_rows() removed in Phase 4 of
+    # database-primary migration. Raw data is now always read from the DB
+    # via RawOccCompsDB.get_all_raw(). Audit trail is in occ_comps_change_log.
 
 
 # ---------------------------------------------------------------------------
@@ -1020,55 +991,9 @@ def _to_number(value) -> Optional[float]:
 # Output: Cleaned Excel
 # ---------------------------------------------------------------------------
 
-def _write_back_locations(rows: list[dict], raw_excel_path: Path):
-    """Write enriched address/town/postcode back to the raw Excel file.
-
-    Only touches cells that were blank in the original and are now filled
-    by the cleaning rules.  This means Haiku and places lookups won't
-    repeat on future runs.  Uses a temp file + copy for OneDrive safety.
-    """
-    raw_excel_path = Path(raw_excel_path)
-    if not raw_excel_path.exists():
-        return
-
-    try:
-        wb = load_workbook(str(raw_excel_path), data_only=False)
-        ws = wb.active
-
-        updates = 0
-        for i, row in enumerate(rows):
-            excel_row = i + 2  # 1-indexed, row 1 is headers
-
-            for col, key in (
-                (COL_ADDRESS, "address"),
-                (COL_TOWN, "town"),
-                (COL_POSTCODE, "postcode"),
-            ):
-                current = ws.cell(row=excel_row, column=col).value
-                new_val = (row.get(key) or "").strip()
-                if (current is None or str(current).strip() == "") and new_val:
-                    ws.cell(row=excel_row, column=col).value = new_val
-                    updates += 1
-
-        if updates > 0:
-            fd, tmp = tempfile.mkstemp(suffix=".xlsx")
-            os.close(fd)
-            try:
-                wb.save(tmp)
-                wb.close()
-                shutil.copy2(tmp, str(raw_excel_path))
-                print(f"  Wrote {updates} location cell(s) back to {raw_excel_path.name}")
-            finally:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-        else:
-            wb.close()
-
-    except Exception as e:
-        logger.warning("Failed to write locations back to raw file: %s", e)
-        print(f"  ⚠ Write-back to raw file failed: {e}")
+    # NOTE: _write_back_locations() removed in Phase 4 of database-primary
+    # migration. Location enrichment is now written back via
+    # RawOccCompsDB.update_locations().
 
 
 def _write_cleaned_excel(rows: list[dict], excel_path: Path):
@@ -1166,6 +1091,7 @@ def _insert_into_db(rows: list[dict], db_path: Path) -> int:
     count = 0
 
     with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.execute("DELETE FROM cleaned_occupational_comps")
         for row in rows:
             try:
